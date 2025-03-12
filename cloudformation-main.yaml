@@ -1,0 +1,1883 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ADRVE - Autonomous Delivery Robot Vision Enhancement POC'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: adrve
+    Description: Name for the project resources
+  
+  OperatorEmail:
+    Type: String
+    Description: Email address for the operator to receive notifications
+    
+  VideoStreamResolution:
+    Type: String
+    Default: "1280x720"
+    Description: Resolution of the video stream
+    
+  VideoStreamFrameRate:
+    Type: Number
+    Default: 15
+    Description: Frame rate of the video stream
+    
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-3-sonnet-20240229-v1:0"
+    Description: Amazon Bedrock model to use for inference
+    
+  FrameExtractionRate:
+    Type: Number
+    Default: 3
+    Description: Number of frames to extract per second for cloud processing
+
+Resources:
+  # S3 Buckets
+  VideoFramesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-video-frames-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFrames
+            Status: Enabled
+            ExpirationInDays: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+  
+  WebAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-webapp-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+  
+  WebAppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebAppBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub "arn:aws:s3:::${WebAppBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+  
+  # Kinesis Video Stream
+  VideoStream:
+    Type: AWS::KinesisVideo::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-video-stream"
+      DataRetentionInHours: 24
+      MediaType: "video/h264"
+      
+  # DynamoDB Tables
+  DetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-detections"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: frameId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: frameId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+  
+  CommandsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-commands"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: commandId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: commandId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+  
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-lambda-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub "arn:aws:s3:::${VideoFramesBucket}/*"
+              - Effect: Allow
+                Action:
+                  - 'kinesisvideo:GetDataEndpoint'
+                  - 'kinesisvideo:GetMedia'
+                  - 'kinesisvideo:ListFragments'
+                Resource: !GetAtt VideoStream.Arn
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                Resource: 
+                  - !GetAtt DetectionsTable.Arn
+                  - !GetAtt CommandsTable.Arn
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+              - Effect: Allow
+                Action:
+                  - 'iot:Publish'
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+
+  # API Gateway Role
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-apigateway-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: 
+                  - !GetAtt FrameProcessorFunction.Arn
+                  - !GetAtt GetDetectionsFunction.Arn
+                  - !GetAtt SendCommandFunction.Arn
+
+  # CloudFront Origin Access Identity
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "OAI for ${ProjectName} web application"
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebAppBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized policy
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin policy
+  
+  # CloudFront Origin Access Control (OAC)
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # IoT Resources
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-iot-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+              - 'iot:Publish'
+            Resource: 
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/status/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/commands/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/status/*"
+
+  # Cognito Identity Pool for web application authentication
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub "${ProjectName}IdentityPool"
+      AllowUnauthenticatedIdentities: false
+      
+  # Cognito Identity Pool Roles
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthRole.Arn
+        
+  # IAM Role for authenticated Cognito users
+  CognitoAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              ForAnyValue:StringLike:
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-cognito-authenticated-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kinesisvideo:GetDataEndpoint'
+                  - 'kinesisvideo:GetMedia'
+                Resource: !GetAtt VideoStream.Arn
+              - Effect: Allow
+                Action:
+                  - 'execute-api:Invoke'
+                Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*"
+              - Effect: Allow
+                Action:
+                  - 'iot:Connect'
+                  - 'iot:Subscribe'
+                  - 'iot:Receive'
+                  - 'iot:Publish'
+                Resource:
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${!cognito-identity.amazonaws.com:sub}"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/status/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/commands/*"
+                  - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/status/*"
+
+  # Lambda Functions
+  FrameProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-frame-processor"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          FRAME_BUCKET: !Ref VideoFramesBucket
+          DETECTION_TABLE: !Ref DetectionsTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import uuid
+          import time
+          import boto3
+          import base64
+          from datetime import datetime
+
+          s3_client = boto3.client('s3')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          iot_client = boto3.client('iot-data')
+
+          # Get environment variables
+          BUCKET_NAME = os.environ['FRAME_BUCKET']
+          DETECTION_TABLE = os.environ['DETECTION_TABLE']
+          BEDROCK_MODEL_ID = os.environ['BEDROCK_MODEL_ID']
+          IOT_TOPIC_PREFIX = os.environ['IOT_TOPIC_PREFIX']
+
+          def extract_frame(kvs_client, stream_name, fragment_number):
+              """Extract a frame from Kinesis Video Stream"""
+              try:
+                  # Get the media for the specific fragment
+                  response = kvs_client.get_media(
+                      StreamName=stream_name,
+                      StartSelector={
+                          'StartSelectorType': 'FRAGMENT_NUMBER',
+                          'AfterFragmentNumber': fragment_number
+                      }
+                  )
+                  
+                  # For simplicity in POC, we're assuming we can extract a frame from the fragment
+                  # In a production system, we would use a proper video frame extractor
+                  payload = response['Payload'].read()
+                  
+                  # For POC purposes, we're just taking a section of the payload as our "frame"
+                  # In production, you would use OpenCV or similar to properly extract the frame
+                  frame_data = payload[:1024*1024]  # Example - first MB of data
+                  
+                  return frame_data
+              except Exception as e:
+                  print(f"Error extracting frame: {str(e)}")
+                  return None
+
+          def detect_objects_with_bedrock(frame_data, timestamp):
+              """Detect objects in the frame using Bedrock"""
+              try:
+                  # For the POC, we'll use base64 encoded image with Claude model
+                  # In production, you might use a specialized computer vision model
+                  
+                  base64_image = base64.b64encode(frame_data).decode('utf-8')
+                  
+                  payload = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 1000,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": [
+                                  {
+                                      "type": "text", 
+                                      "text": "Analyze this image from an urban street scene. Identify all humans, vehicles (cars, bikes, etc.), animals, and other potential obstacles. For each object, provide its location in the image (top, bottom, left, right) and confidence score. Format the response as JSON only."
+                                  },
+                                  {
+                                      "type": "image", 
+                                      "source": {
+                                          "type": "base64", 
+                                          "media_type": "image/jpeg", 
+                                          "data": base64_image
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  }
+                  
+                  response = bedrock_runtime.invoke_model(
+                      modelId=BEDROCK_MODEL_ID,
+                      body=json.dumps(payload)
+                  )
+                  
+                  response_body = json.loads(response['body'].read())
+                  
+                  # Extract the JSON content from Claude's response
+                  # This is a simplified approach - production code would need more robust parsing
+                  content = response_body.get('content', [{}])[0].get('text', '{}')
+                  
+                  # Try to parse the JSON from Claude's response
+                  try:
+                      detection_data = json.loads(content)
+                  except json.JSONDecodeError:
+                      # If Claude didn't return valid JSON, create a basic structure
+                      detection_data = {"objects": [], "error": "Failed to parse model output"}
+                  
+                  # Add metadata
+                  detection_data['timestamp'] = timestamp
+                  detection_data['source'] = 'cloud'
+                  
+                  return detection_data
+              
+              except Exception as e:
+                  print(f"Error in Bedrock detection: {str(e)}")
+                  return {
+                      "objects": [],
+                      "error": str(e),
+                      "timestamp": timestamp,
+                      "source": "cloud"
+                  }
+
+          def store_frame_and_detection(frame_data, detection_data, timestamp):
+              """Store frame in S3 and detection results in DynamoDB"""
+              try:
+                  # Generate unique ID for this frame
+                  frame_id = str(uuid.uuid4())
+                  
+                  # Save frame to S3
+                  frame_key = f"frames/{datetime.utcfromtimestamp(timestamp).strftime('%Y/%m/%d/%H')}/" + \
+                             f"{timestamp}_{frame_id}.jpg"
+                  
+                  s3_client.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=frame_key,
+                      Body=frame_data,
+                      ContentType='image/jpeg'
+                  )
+                  
+                  # Store detection results in DynamoDB
+                  table = dynamodb.Table(DETECTION_TABLE)
+                  
+                  item = {
+                      'frameId': frame_id,
+                      'timestamp': int(timestamp),
+                      'frameS3Path': frame_key,
+                      'detectionResults': detection_data,
+                      'ttl': int(timestamp) + (7 * 24 * 60 * 60)  # 7 days TTL
+                  }
+                  
+                  table.put_item(Item=item)
+                  
+                  return frame_id
+              
+              except Exception as e:
+                  print(f"Error storing frame and detection: {str(e)}")
+                  return None
+
+          def send_command_to_edge(detection_data, device_id):
+              """Send command to edge device if necessary"""
+              # Simple logic: if humans or animals detected with high confidence, send stop command
+              # In production, this would be more sophisticated
+              
+              try:
+                  # Check for objects of interest
+                  should_stop = False
+                  critical_objects = []
+                  
+                  for obj in detection_data.get('objects', []):
+                      object_type = obj.get('type', '').lower()
+                      confidence = obj.get('confidence', 0)
+                      
+                      if (object_type in ['human', 'person', 'pedestrian', 'animal', 'dog', 'cat']) and confidence > 0.7:
+                          should_stop = True
+                          critical_objects.append(object_type)
+                  
+                  if should_stop:
+                      command = {
+                          'command': 'stop',
+                          'reason': f"Critical objects detected: {', '.join(critical_objects)}",
+                          'timestamp': int(time.time())
+                      }
+                      
+                      # Publish to IoT topic
+                      topic = f"{IOT_TOPIC_PREFIX}/commands/{device_id}"
+                      iot_client.publish(
+                          topic=topic,
+                          payload=json.dumps(command)
+                      )
+                      
+                      return True
+              
+              except Exception as e:
+                  print(f"Error sending command: {str(e)}")
+              
+              return False
+
+          def lambda_handler(event, context):
+              """Main Lambda handler function"""
+              # In a real implementation, this would be triggered by Kinesis Data Stream
+              # For POC purposes, we assume the event contains:
+              # - streamName: The Kinesis Video Stream name
+              # - fragmentNumber: The fragment to process
+              # - deviceId: The edge device ID
+              
+              try:
+                  stream_name = event.get('streamName')
+                  fragment_number = event.get('fragmentNumber')
+                  device_id = event.get('deviceId')
+                  
+                  if not all([stream_name, fragment_number, device_id]):
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Missing required parameters')
+                      }
+                  
+                  # Get KVS client
+                  kvs_client = boto3.client('kinesisvideo')
+                  data_endpoint_response = kvs_client.get_data_endpoint(
+                      StreamName=stream_name,
+                      APIName='GET_MEDIA'
+                  )
+                  
+                  endpoint = data_endpoint_response['DataEndpoint']
+                  kvs_client = boto3.client('kinesisvideo', endpoint_url=endpoint)
+                  
+                  # Current timestamp
+                  timestamp = int(time.time())
+                  
+                  # Extract frame
+                  frame_data = extract_frame(kvs_client, stream_name, fragment_number)
+                  if not frame_data:
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps('Failed to extract frame')
+                      }
+                  
+                  # Detect objects
+                  detection_data = detect_objects_with_bedrock(frame_data, timestamp)
+                  
+                  # Store frame and detection results
+                  frame_id = store_frame_and_detection(frame_data, detection_data, timestamp)
+                  
+                  # Send command to edge if necessary
+                  command_sent = send_command_to_edge(detection_data, device_id)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'frameId': frame_id,
+                          'commandSent': command_sent,
+                          'objectsDetected': len(detection_data.get('objects', []))
+                      })
+                  }
+              
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  GetDetectionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-detections"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          DETECTION_TABLE: !Ref DetectionsTable
+          FRAME_BUCKET: !Ref VideoFramesBucket
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from decimal import Decimal
+          from boto3.dynamodb.conditions import Key
+
+          # Helper class to convert DynamoDB items to JSON
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def lambda_handler(event, context):
+              """Get detection results from DynamoDB"""
+              try:
+                  # Get query parameters
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  frame_id = query_params.get('frameId')
+                  start_time = query_params.get('startTime')
+                  end_time = query_params.get('endTime')
+                  
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['DETECTION_TABLE'])
+                  
+                  # If frame_id is provided, get a specific detection
+                  if frame_id:
+                      response = table.query(
+                          KeyConditionExpression=Key('frameId').eq(frame_id)
+                      )
+                      items = response.get('Items', [])
+                      
+                      # Generate presigned URLs for the frames
+                      for item in items:
+                          if 'frameS3Path' in item:
+                              s3_client = boto3.client('s3')
+                              item['frameUrl'] = s3_client.generate_presigned_url(
+                                  'get_object',
+                                  Params={
+                                      'Bucket': os.environ['FRAME_BUCKET'],
+                                      'Key': item['frameS3Path']
+                                  },
+                                  ExpiresIn=3600
+                              )
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps(items, cls=DecimalEncoder)
+                      }
+                  
+                  # If time range is provided, scan by timestamp
+                  # Note: In production, you would use a Global Secondary Index for this
+                  elif start_time and end_time:
+                      # Convert to integers
+                      start_time = int(start_time)
+                      end_time = int(end_time)
+                      
+                      scan_kwargs = {
+                          'FilterExpression': Key('timestamp').between(start_time, end_time)
+                      }
+                      
+                      # Scan DynamoDB
+                      items = []
+                      done = False
+                      start_key = None
+                      
+                      while not done:
+                          if start_key:
+                              scan_kwargs['ExclusiveStartKey'] = start_key
+                          response = table.scan(**scan_kwargs)
+                          items.extend(response.get('Items', []))
+                          start_key = response.get('LastEvaluatedKey')
+                          done = start_key is None
+                      
+                      # Sort by timestamp
+                      items.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+                      
+                      # Limit results (for performance)
+                      items = items[:100]
+                      
+                      # Generate presigned URLs for the frames
+                      s3_client = boto3.client('s3')
+                      for item in items:
+                          if 'frameS3Path' in item:
+                              item['frameUrl'] = s3_client.generate_presigned_url(
+                                  'get_object',
+                                  Params={
+                                      'Bucket': os.environ['FRAME_BUCKET'],
+                                      'Key': item['frameS3Path']
+                                  },
+                                  ExpiresIn=3600
+                              )
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps(items, cls=DecimalEncoder)
+                      }
+                  
+                  # Default: get latest detections (limited to 20)
+                  else:
+                      # In production, you would use a Global Secondary Index for this
+                      # For POC, we'll do a simple scan and sort
+                      response = table.scan(Limit=100)
+                      items = response.get('Items', [])
+                      
+                      # Sort by timestamp (descending)
+                      items.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+                      
+                      # Limit results
+                      items = items[:20]
+                      
+                      # Generate presigned URLs for the frames
+                      s3_client = boto3.client('s3')
+                      for item in items:
+                          if 'frameS3Path' in item:
+                              item['frameUrl'] = s3_client.generate_presigned_url(
+                                  'get_object',
+                                  Params={
+                                      'Bucket': os.environ['FRAME_BUCKET'],
+                                      'Key': item['frameS3Path']
+                                  },
+                                  ExpiresIn=3600
+                              )
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps(items, cls=DecimalEncoder)
+                      }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  SendCommandFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-send-command"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          COMMANDS_TABLE: !Ref CommandsTable
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import time
+          import uuid
+          import boto3
+
+          def lambda_handler(event, context):
+              """Send command to edge device"""
+              try:
+                  # Parse the request body
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  command = body.get('command')
+                  reason = body.get('reason')
+                  device_id = body.get('deviceId')
+                  
+                  # Validate required fields
+                  if not all([command, device_id]):
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'error': 'Missing required fields'})
+                      }
+                  
+                  # Set default reason if not provided
+                  if not reason:
+                      reason = f"Operator triggered {command}"
+                  
+                  # Generate command ID and timestamp
+                  command_id = str(uuid.uuid4())
+                  timestamp = int(time.time())
+                  
+                  # Create command payload
+                  command_payload = {
+                      'command': command,
+                      'reason': reason,
+                      'timestamp': timestamp,
+                      'commandId': command_id
+                  }
+                  
+                  # Store command in DynamoDB
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['COMMANDS_TABLE'])
+                  
+                  table.put_item(
+                      Item={
+                          'commandId': command_id,
+                          'timestamp': timestamp,
+                          'command': command,
+                          'reason': reason,
+                          'deviceId': device_id,
+                          'ttl': timestamp + (7 * 24 * 60 * 60)  # 7 days TTL
+                      }
+                  )
+                  
+                  # Send command to IoT Core
+                  iot_client = boto3.client('iot-data')
+                  topic = f"{os.environ['IOT_TOPIC_PREFIX']}/commands/{device_id}"
+                  
+                  iot_client.publish(
+                      topic=topic,
+                      payload=json.dumps(command_payload)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'success': True,
+                          'commandId': command_id,
+                          'timestamp': timestamp
+                      })
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # Lambda to process Kinesis Video Stream fragments
+  KVSProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-kvs-processor"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          VIDEO_STREAM_NAME: !Ref VideoStream
+          FRAME_PROCESSOR_FUNCTION: !Ref FrameProcessorFunction
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import time
+
+          def lambda_handler(event, context):
+              """Process Kinesis Video Stream fragments"""
+              try:
+                  stream_name = os.environ['VIDEO_STREAM_NAME']
+                  
+                  # Extract device ID from event or use default
+                  device_id = event.get('deviceId', 'default-device')
+                  
+                  # Get KVS client
+                  kvs_client = boto3.client('kinesisvideo')
+                  
+                  # List fragments
+                  response = kvs_client.list_fragments(
+                      StreamName=stream_name,
+                      MaxResults=1  # Get the latest fragment for POC
+                  )
+                  
+                  # Check if we have fragments
+                  fragments = response.get('Fragments', [])
+                  if not fragments:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps('No fragments found')
+                      }
+                  
+                  # Get the latest fragment
+                  latest_fragment = fragments[0]
+                  fragment_number = latest_fragment.get('FragmentNumber')
+                  
+                  # Invoke the frame processor function
+                  lambda_client = boto3.client('lambda')
+                  lambda_client.invoke(
+                      FunctionName=os.environ['FRAME_PROCESSOR_FUNCTION'],
+                      InvocationType='Event',  # Asynchronous invocation
+                      Payload=json.dumps({
+                          'streamName': stream_name,
+                          'fragmentNumber': fragment_number,
+                          'deviceId': device_id
+                      })
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'fragmentNumber': fragment_number,
+                          'fragmentProcessed': True
+                      })
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  # Lambda trigger for periodic processing of video stream
+  KVSProcessorScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-kvs-processor-schedule"
+      Description: "Trigger KVS Processor every minute"
+      ScheduleExpression: "rate(1 minute)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KVSProcessorFunction.Arn
+          Id: "KVSProcessorTarget"
+          Input: '{"deviceId": "adrve-edge-device"}'
+
+  KVSProcessorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KVSProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KVSProcessorScheduleRule.Arn
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      Description: "API for ADRVE web application"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resources
+  DetectionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "detections"
+
+  CommandsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "commands"
+
+  # API Gateway Methods
+  GetDetectionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DetectionsResource
+      HttpMethod: GET
+      AuthorizationType: NONE  # For POC, in production you would use Cognito or API Key
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: "400"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: "500"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetDetectionsFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          - StatusCode: "400"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            SelectionPattern: "4\\d{2}"
+          - StatusCode: "500"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            SelectionPattern: "5\\d{2}"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: |
+            {
+              "queryStringParameters": $input.json('$.queryStringParameters')
+            }
+
+  SendCommandMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref CommandsResource
+      HttpMethod: POST
+      AuthorizationType: NONE  # For POC, in production you would use Cognito or API Key
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: "400"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: "500"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendCommandFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          - StatusCode: "400"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            SelectionPattern: "4\\d{2}"
+          - StatusCode: "500"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            SelectionPattern: "5\\d{2}"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: |
+            {
+              "body": $input.json('$')
+            }
+
+  # Add OPTIONS methods for CORS
+  DetectionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DetectionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  CommandsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref CommandsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetDetectionsMethod
+      - SendCommandMethod
+      - DetectionsOptionsMethod
+      - CommandsOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: "prod"
+
+  # Lambda permissions for API Gateway
+  GetDetectionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetDetectionsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/detections"
+
+  SendCommandPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendCommandFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/commands"
+
+  # Deploy web application to S3
+  WebAppDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - WebAppBucket
+      - CloudFrontDistribution
+    Properties:
+      ServiceToken: !GetAtt DeployWebAppFunction.Arn
+      WebAppBucket: !Ref WebAppBucket
+      CloudFrontDistribution: !Ref CloudFrontDistribution
+      ApiEndpoint: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+      IoTEndpoint: !GetAtt GetIoTEndpointFunction.IoTEndpoint
+      KinesisVideoStreamName: !Ref VideoStream
+      IdentityPoolId: !Ref IdentityPool
+      Region: !Ref AWS::Region
+      ProjectName: !Ref ProjectName
+
+  # Lambda function to get IoT endpoint
+  GetIoTEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-iot-endpoint"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              """Get IoT endpoint for the account"""
+              try:
+                  iot_client = boto3.client('iot')
+                  response = iot_client.describe_endpoint(
+                      endpointType='iot:Data-ATS'
+                  )
+                  endpoint = response.get('endpointAddress')
+                  
+                  return {
+                      'IoTEndpoint': endpoint
+                  }
+              except Exception as e:
+                  print(f"Error getting IoT endpoint: {str(e)}")
+                  # Return a default error endpoint
+                  return {
+                      'IoTEndpoint': 'error-getting-endpoint.iot.region.amazonaws.com'
+                  }
+
+  # Lambda function to deploy web application to S3
+  DeployWebAppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-deploy-webapp"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import os
+          import tempfile
+
+          def lambda_handler(event, context):
+              """Deploy web application to S3 bucket"""
+              # Get parameters
+              bucket_name = event['ResourceProperties']['WebAppBucket']
+              cloudfront_distribution = event['ResourceProperties']['CloudFrontDistribution']
+              api_endpoint = event['ResourceProperties']['ApiEndpoint']
+              iot_endpoint = event['ResourceProperties']['IoTEndpoint']
+              kinesis_video_stream = event['ResourceProperties']['KinesisVideoStreamName']
+              identity_pool_id = event['ResourceProperties']['IdentityPoolId']
+              region = event['ResourceProperties']['Region']
+              project_name = event['ResourceProperties']['ProjectName']
+              
+              # Skip processing for DELETE events
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              try:
+                  s3_client = boto3.client('s3')
+                  
+                  # Create index.html with configuration
+                  index_html = """
+                  <!DOCTYPE html>
+                  <html lang="en">
+                  <head>
+                      <meta charset="UTF-8">
+                      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                      <title>ADRVE Operator Interface</title>
+                      <script src="https://cdnjs.cloudflare.com/ajax/libs/aws-sdk/2.1001.0/aws-sdk.min.js"></script>
+                      <script src="https://cdnjs.cloudflare.com/ajax/libs/amazon-kinesis-video-streams-webrtc/2.0.0/kvs-webrtc.min.js"></script>
+                      <script>
+                          // Configuration variables 
+                          window.config = {
+                              apiEndpoint: '""" + api_endpoint + """',
+                              region: '""" + region + """',
+                              iotEndpoint: '""" + iot_endpoint + """',
+                              identityPoolId: '""" + identity_pool_id + """',
+                              streamName: '""" + kinesis_video_stream + """',
+                              deviceId: 'adrve-edge-device',
+                              topicPrefix: '""" + project_name + """'
+                          };
+                      </script>
+                      <link rel="stylesheet" href="app.css">
+                  </head>
+                  <body>
+                      <div class="header">
+                          <h1>ADRVE Operator Interface</h1>
+                      </div>
+                      
+                      <div class="container">
+                          <div class="video-container">
+                              <div class="video-wrapper">
+                                  <video id="videoPlayer" autoplay playsinline muted></video>
+                                  <div id="detectionOverlay" class="detection-overlay"></div>
+                              </div>
+                          </div>
+                          
+                          <div class="controls">
+                              <h2>Device Controls</h2>
+                              <div>
+                                  <button id="connectBtn">Connect</button>
+                                  <button id="stopBtn" class="stop">Emergency Stop</button>
+                                  <button id="resumeBtn">Resume</button>
+                              </div>
+                              <div id="connectionStatus" class="status disconnected">
+                                  Disconnected
+                              </div>
+                          </div>
+                          
+                          <div class="detection-panel">
+                              <h2>Latest Detections</h2>
+                              <div id="detectionsList"></div>
+                          </div>
+                          
+                          <div class="command-history">
+                              <h2>Command History</h2>
+                              <div id="commandHistory"></div>
+                          </div>
+                      </div>
+                      
+                      <script src="app.js"></script>
+                  </body>
+                  </html>
+                  """
+                  
+                  # Create app.js with application logic
+                  app_js = """
+                  // Get configuration from window.config
+                  const config = window.config;
+                  
+                  // AWS Configuration
+                  AWS.config.region = config.region;
+                  AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+                      IdentityPoolId: config.identityPoolId
+                  });
+                  
+                  // Global variables
+                  let iotClient = null;
+                  let kinesisVideoClient = null;
+                  let signalingClient = null;
+                  let peerConnection = null;
+                  let dataChannel = null;
+                  let connected = false;
+                  let latestDetections = {
+                      edge: [],
+                      cloud: []
+                  };
+                  
+                  // DOM elements
+                  const videoPlayer = document.getElementById('videoPlayer');
+                  const detectionOverlay = document.getElementById('detectionOverlay');
+                  const detectionsList = document.getElementById('detectionsList');
+                  const commandHistory = document.getElementById('commandHistory');
+                  const connectBtn = document.getElementById('connectBtn');
+                  const stopBtn = document.getElementById('stopBtn');
+                  const resumeBtn = document.getElementById('resumeBtn');
+                  const connectionStatus = document.getElementById('connectionStatus');
+                  
+                  // Initialize the application
+                  async function init() {
+                      connectBtn.addEventListener('click', connect);
+                      stopBtn.addEventListener('click', sendStopCommand);
+                      resumeBtn.addEventListener('click', sendResumeCommand);
+                      
+                      try {
+                          await AWS.config.credentials.getPromise();
+                          console.log("AWS credentials loaded successfully");
+                      } catch (error) {
+                          console.error("Failed to load AWS credentials:", error);
+                          connectionStatus.textContent = "Failed to initialize AWS credentials";
+                      }
+                      
+                      // Start fetching detections periodically
+                      setInterval(fetchLatestDetections, 5000);
+                  }
+                  
+                  // Connect to the edge device
+                  async function connect() {
+                      try {
+                          connectionStatus.textContent = "Connecting...";
+                          
+                          // Initialize IoT client
+                          initializeIoT();
+                          
+                          // Initialize KVS WebRTC
+                          await initializeKVS();
+                          
+                          connected = true;
+                          connectionStatus.textContent = "Connected";
+                          connectionStatus.className = "status connected";
+                      } catch (error) {
+                          console.error("Connection failed:", error);
+                          connectionStatus.textContent = "Connection failed: " + error.message;
+                          connectionStatus.className = "status disconnected";
+                      }
+                  }
+                  
+                  // Initialize AWS IoT client
+                  function initializeIoT() {
+                      AWS.config.credentials.get(function(err) {
+                          if (err) {
+                              console.error("Error getting AWS credentials:", err);
+                              return;
+                          }
+                          
+                          // Initialize the IoT client
+                          iotClient = new AWS.IotData({ endpoint: config.iotEndpoint });
+                          
+                          console.log("IoT client initialized");
+                      });
+                  }
+                  
+                  // Fetch latest detections from API
+                  async function fetchLatestDetections() {
+                      try {
+                          const response = await fetch(`${config.apiEndpoint}/detections`);
+                          const data = await response.json();
+                          
+                          if (data && data.length > 0) {
+                              // Process the latest detections
+                              for (const item of data.slice(0, 5)) {
+                                  if (item.detectionResults) {
+                                      const source = item.detectionResults.source || 'cloud';
+                                      const detections = [];
+                                      
+                                      // Process objects from detection results
+                                      for (const obj of item.detectionResults.objects || []) {
+                                          detections.push({
+                                              box: obj.box || obj.location || [0, 0, 100, 100],
+                                              class: obj.type || obj.class || 'unknown',
+                                              confidence: obj.confidence || 0.5
+                                          });
+                                      }
+                                      
+                                      // Update based on source
+                                      if (source === 'edge') {
+                                          latestDetections.edge = detections;
+                                      } else {
+                                          latestDetections.cloud = detections;
+                                      }
+                                  }
+                              }
+                              
+                              // Update UI
+                              updateDetectionOverlay();
+                              updateDetectionsList();
+                          }
+                      } catch (error) {
+                          console.error("Error fetching detections:", error);
+                      }
+                  }
+                  
+                  // Initialize KVS WebRTC
+                  async function initializeKVS() {
+                      // In a real implementation, this would use the KVS WebRTC SDK
+                      // For the POC, we're simulating the video feed
+                      
+                      console.log("Initializing KVS WebRTC (simulated for POC)");
+                      
+                      // Simulate connection delay
+                      await new Promise(resolve => setTimeout(resolve, 1500));
+                      
+                      // Use a fallback video for demonstration
+                      // In production, this would be the actual KVS WebRTC stream
+                      
+                      // For this POC, we'll use a canvas to simulate video
+                      const canvas = document.createElement('canvas');
+                      canvas.width = 640;
+                      canvas.height = 480;
+                      const ctx = canvas.getContext('2d');
+                      
+                      // Create a video stream from the canvas
+                      const stream = canvas.captureStream(30);
+                      videoPlayer.srcObject = stream;
+                      
+                      // Simple animation to simulate video feed
+                      function drawFrame() {
+                          // Clear canvas
+                          ctx.fillStyle = '#000000';
+                          ctx.fillRect(0, 0, canvas.width, canvas.height);
+                          
+                          // Draw simulated scene
+                          ctx.fillStyle = '#333333';
+                          ctx.fillRect(100, 100, 440, 280);
+                          
+                          // Draw simulated street
+                          ctx.fillStyle = '#555555';
+                          ctx.fillRect(0, 350, 640, 130);
+                          
+                          // Draw timestamp
+                          ctx.fillStyle = '#ffffff';
+                          ctx.font = '14px Arial';
+                          ctx.fillText(new Date().toISOString(), 10, 20);
+                          
+                          // Draw some simulated objects
+                          // These would be based on actual detections in production
+                          
+                          // Car
+                          ctx.fillStyle = '#0000ff';
+                          ctx.fillRect(200, 300, 100, 50);
+                          
+                          // Person
+                          ctx.fillStyle = '#00ff00';
+                          ctx.fillRect(400, 280, 30, 70);
+                          
+                          requestAnimationFrame(drawFrame);
+                      }
+                      
+                      drawFrame();
+                      
+                      console.log("KVS WebRTC initialized (simulated)");
+                  }
+                  
+                  // Update the detection overlay on the video
+                  function updateDetectionOverlay() {
+                      // Clear previous overlay
+                      detectionOverlay.innerHTML = '';
+                      
+                      // Get video dimensions
+                      const videoWidth = videoPlayer.clientWidth;
+                      const videoHeight = videoPlayer.clientHeight;
+                      
+                      // Add edge detections (green)
+                      latestDetections.edge.forEach(detection => {
+                          addDetectionBox(detection, "edge", videoWidth, videoHeight);
+                      });
+                      
+                      // Add cloud detections (blue)
+                      latestDetections.cloud.forEach(detection => {
+                          addDetectionBox(detection, "cloud", videoWidth, videoHeight);
+                      });
+                  }
+                  
+                  // Add a detection box to the overlay
+                  function addDetectionBox(detection, source, videoWidth, videoHeight) {
+                      if (!detection.box || detection.box.length !== 4) return;
+                      
+                      // Get box coordinates
+                      const [x1, y1, x2, y2] = detection.box;
+                      
+                      // Create box element
+                      const box = document.createElement('div');
+                      box.className = `detection-box ${source}`;
+                      box.style.left = `${(x1 / 640) * videoWidth}px`;
+                      box.style.top = `${(y1 / 480) * videoHeight}px`;
+                      box.style.width = `${((x2 - x1) / 640) * videoWidth}px`;
+                      box.style.height = `${((y2 - y1) / 480) * videoHeight}px`;
+                      
+                      // Create label
+                      const label = document.createElement('div');
+                      label.className = 'detection-label';
+                      label.style.left = `${(x1 / 640) * videoWidth}px`;
+                      label.style.top = `${((y1 / 480) * videoHeight) - 20}px`;
+                      label.textContent = `${detection.class} (${Math.round(detection.confidence * 100)}%)`;
+                      
+                      // Add to overlay
+                      detectionOverlay.appendChild(box);
+                      detectionOverlay.appendChild(label);
+                  }
+                  
+                  // Update the detections list
+                  function updateDetectionsList() {
+                      // Clear previous list
+                      detectionsList.innerHTML = '';
+                      
+                      // Combine detections
+                      const allDetections = [
+                          ...latestDetections.edge.map(d => ({ ...d, source: 'edge' })),
+                          ...latestDetections.cloud.map(d => ({ ...d, source: 'cloud' }))
+                      ];
+                      
+                      // Sort by confidence (descending)
+                      allDetections.sort((a, b) => b.confidence - a.confidence);
+                      
+                      // Create list items
+                      allDetections.forEach(detection => {
+                          const item = document.createElement('div');
+                          item.className = 'detection-item';
+                          item.textContent = `[${detection.source.toUpperCase()}] ${detection.class} (${Math.round(detection.confidence * 100)}% confidence)`;
+                          detectionsList.appendChild(item);
+                      });
+                      
+                      // If no detections
+                      if (allDetections.length === 0) {
+                          const item = document.createElement('div');
+                          item.textContent = 'No detections';
+                          detectionsList.appendChild(item);
+                      }
+                  }
+                  
+                  // Send stop command to edge device
+                  function sendStopCommand() {
+                      sendCommand('stop', 'Operator triggered emergency stop');
+                  }
+                  
+                  // Send resume command to edge device
+                  function sendResumeCommand() {
+                      sendCommand('resume', 'Operator resumed operation');
+                  }
+                  
+                  // Send a command to the edge device
+                  async function sendCommand(command, reason) {
+                      if (!connected) {
+                          alert("Not connected to device");
+                          return;
+                      }
+                      
+                      try {
+                          const response = await fetch(`${config.apiEndpoint}/commands`, {
+                              method: 'POST',
+                              headers: {
+                                  'Content-Type': 'application/json'
+                              },
+                              body: JSON.stringify({
+                                  command: command,
+                                  reason: reason,
+                                  deviceId: config.deviceId
+                              })
+                          });
+                          
+                          const data = await response.json();
+                          
+                          if (data.success) {
+                              // Add to command history
+                              addCommandToHistory({
+                                  command: command,
+                                  reason: reason,
+                                  timestamp: data.timestamp
+                              });
+                              
+                              console.log(`${command} command sent successfully`);
+                          } else {
+                              alert(`Failed to send ${command} command: ${data.error}`);
+                          }
+                      } catch (error) {
+                          console.error(`Error sending ${command} command:`, error);
+                          alert(`Error sending ${command} command: ${error.message}`);
+                      }
+                  }
+                  
+                  // Add a command to the history
+                  function addCommandToHistory(command) {
+                      const item = document.createElement('div');
+                      item.className = `command-item ${command.command}`;
+                      
+                      const time = new Date(command.timestamp * 1000).toLocaleTimeString();
+                      item.textContent = `[${time}] ${command.command.toUpperCase()}: ${command.reason}`;
+                      
+                      // Add to top of history
+                      commandHistory.insertBefore(item, commandHistory.firstChild);
+                  }
+                  
+                  // Initialize the application when the page loads
+                  window.addEventListener('load', init);
+                  """
+                  
+                  # Create app.css with styling
+                  app_css = """
+                  body {
+                      font-family: Arial, sans-serif;
+                      margin: 0;
+                      padding: 0;
+                      background-color: #f0f0f0;
+                  }
+                  .container {
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      padding: 20px;
+                  }
+                  .header {
+                      background-color: #232f3e;
+                      color: white;
+                      padding: 15px;
+                      text-align: center;
+                  }
+                  .video-container {
+                      display: flex;
+                      flex-direction: column;
+                      margin-top: 20px;
+                  }
+                  .video-wrapper {
+                      position: relative;
+                      margin-bottom: 20px;
+                  }
+                  video {
+                      width: 100%;
+                      border: 1px solid #ddd;
+                      background-color: #000;
+                      height: 480px;
+                  }
+                  .controls {
+                      background-color: white;
+                      padding: 15px;
+                      border-radius: 5px;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                      margin-top: 20px;
+                  }
+                  .detection-overlay {
+                      position: absolute;
+                      top: 0;
+                      left: 0;
+                      width: 100%;
+                      height: 100%;
+                      pointer-events: none;
+                  }
+                  .detection-box {
+                      position: absolute;
+                      border: 2px solid;
+                      box-sizing: border-box;
+                  }
+                  .detection-box.edge {
+                      border-color: green;
+                  }
+                  .detection-box.cloud {
+                      border-color: blue;
+                  }
+                  .detection-label {
+                      position: absolute;
+                      background-color: rgba(0,0,0,0.7);
+                      color: white;
+                      padding: 2px 5px;
+                      font-size: 12px;
+                      white-space: nowrap;
+                  }
+                  .detection-panel {
+                      background-color: white;
+                      padding: 15px;
+                      border-radius: 5px;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                      margin-top: 20px;
+                      max-height: 300px;
+                      overflow-y: auto;
+                  }
+                  .detection-item {
+                      padding: 8px;
+                      border-bottom: 1px solid #eee;
+                  }
+                  .command-history {
+                      background-color: white;
+                      padding: 15px;
+                      border-radius: 5px;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                      margin-top: 20px;
+                      max-height: 200px;
+                      overflow-y: auto;
+                  }
+                  .command-item {
+                      padding: 8px;
+                      border-bottom: 1px solid #eee;
+                  }
+                  .command-item.stop {
+                      background-color: rgba(255,0,0,0.1);
+                  }
+                  button {
+                      background-color: #ff9900;
+                      color: white;
+                      border: none;
+                      padding: 10px 15px;
+                      border-radius: 4px;
+                      cursor: pointer;
+                      margin-right: 10px;
+                  }
+                  button:hover {
+                      background-color: #e88a00;
+                  }
+                  button.stop {
+                      background-color: #d13212;
+                  }
+                  button.stop:hover {
+                      background-color: #ba2b0f;
+                  }
+                  .status {
+                      margin-top: 10px;
+                      padding: 10px;
+                      border-radius: 4px;
+                  }
+                  .status.connected {
+                      background-color: rgba(0,128,0,0.1);
+                      color: green;
+                  }
+                  .status.disconnected {
+                      background-color: rgba(255,0,0,0.1);
+                      color: red;
+                  }
+                  """
+                  
+                  # Create error.html
+                  error_html = """
+                  <!DOCTYPE html>
+                  <html lang="en">
+                  <head>
+                      <meta charset="UTF-8">
+                      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                      <title>Error - ADRVE</title>
+                      <style>
+                          body {
+                              font-family: Arial, sans-serif;
+                              text-align: center;
+                              padding: 50px;
+                          }
+                          h1 {
+                              color: #d13212;
+                          }
+                          .container {
+                              max-width: 600px;
+                              margin: 0 auto;
+                          }
+                          .link {
+                              color: #0073bb;
+                              text-decoration: none;
+                          }
+                          .link:hover {
+                              text-decoration: underline;
+                          }
+                      </style>
+                  </head>
+                  <body>
+                      <div class="container">
+                          <h1>Page Not Found</h1>
+                          <p>Sorry, the page you're looking for doesn't exist.</p>
+                          <p><a class="link" href="/">Return to Home</a></p>
+                      </div>
+                  </body>
+                  </html>
+                  """
+                  
+                  # Create temporary files
+                  with tempfile.TemporaryDirectory() as tmpdirname:
+                      # Write files to temporary directory
+                      with open(os.path.join(tmpdirname, 'index.html'), 'w') as f:
+                          f.write(index_html)
+                      
+                      with open(os.path.join(tmpdirname, 'app.js'), 'w') as f:
+                          f.write(app_js)
+                      
+                      with open(os.path.join(tmpdirname, 'app.css'), 'w') as f:
+                          f.write(app_css)
+                      
+                      with open(os.path.join(tmpdirname, 'error.html'), 'w') as f:
+                          f.write(error_html)
+                      
+                      # Upload files to S3
+                      for file_name in ['index.html', 'app.js', 'app.css', 'error.html']:
+                          file_path = os.path.join(tmpdirname, file_name)
+                          
+                          # Set content type based on file extension
+                          content_type = 'text/html'
+                          if file_name.endswith('.js'):
+                              content_type = 'application/javascript'
+                          elif file_name.endswith('.css'):
+                              content_type = 'text/css'
+                          
+                          with open(file_path, 'rb') as f:
+                              s3_client.upload_fileobj(
+                                  f,
+                                  bucket_name,
+                                  file_name,
+                                  ExtraArgs={'ContentType': content_type}
+                              )
+                  
+                  print(f"Web application deployed to S3 bucket: {bucket_name}")
+                  
+                  # Create CloudFront invalidation
+                  cloudfront_client = boto3.client('cloudfront')
+                  cloudfront_client.create_invalidation(
+                      DistributionId=cloudfront_distribution,
+                      InvalidationBatch={
+                          'Paths': {
+                              'Quantity': 1,
+                              'Items': ['/*']
+                          },
+                          'CallerReference': str(int(time.time()))
+                      }
+                  )
+                  
+                  print(f"CloudFront invalidation created for distribution: {cloudfront_distribution}")
+                  
+                  # Return success
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'Web application deployed'})
+              
+              except Exception as e:
+                  print(f"Error deploying web application: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+Outputs:
+  VideoStreamName:
+    Description: Kinesis Video Stream Name
+    Value: !Ref VideoStream
+    
+  VideoFramesBucketName:
+    Description: S3 Bucket for Video Frames
+    Value: !Ref VideoFramesBucket
+    
+  WebAppBucketName:
+    Description: S3 Bucket for Web Application
+    Value: !Ref WebAppBucket
+    
+  CloudFrontDomain:
+    Description: CloudFront Domain Name for Web Application
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    
+  ApiEndpoint:
+    Description: API Gateway Endpoint for Web Application
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    
+  IoTPolicyName:
+    Description: IoT Policy for Edge Device
+    Value: !Ref IoTPolicy
+    
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref IdentityPool
