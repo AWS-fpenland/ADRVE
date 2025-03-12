@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ADRVE - Autonomous Delivery Robot Vision Enhancement POC'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: adrve
+    Description: Name for the project resources
+  
+  OperatorEmail:
+    Type: String
+    Description: Email address for the operator to receive notifications
+    
+  VideoStreamResolution:
+    Type: String
+    Default: "1280x720"
+    Description: Resolution of the video stream
+    
+  VideoStreamFrameRate:
+    Type: Number
+    Default: 15
+    Description: Frame rate of the video stream
+    
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-3-sonnet-20240229-v1:0"
+    Description: Amazon Bedrock model to use for inference
+    
+  FrameExtractionRate:
+    Type: Number
+    Default: 3
+    Description: Number of frames to extract per second for cloud processing
+
+Resources:
+  # S3 Buckets
+  VideoFramesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-video-frames-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFrames
+            Status: Enabled
+            ExpirationInDays: 7
+  
+  WebAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-webapp-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+  
+  # Kinesis Video Stream
+  VideoStream:
+    Type: AWS::KinesisVideo::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-video-stream"
+      DataRetentionInHours: 24
+      MediaType: "video/h264"
+      
+  # DynamoDB Tables
+  DetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-detections"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: frameId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: frameId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+  
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-lambda-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub "arn:aws:s3:::${VideoFramesBucket}/*"
+              - Effect: Allow
+                Action:
+                  - 'kinesisvideo:GetDataEndpoint'
+                  - 'kinesisvideo:GetMedia'
+                Resource: !GetAtt VideoStream.Arn
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:GetItem'
+                Resource: !GetAtt DetectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+              - Effect: Allow
+                Action:
+                  - 'iot:Publish'
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+
+  # IoT Resources
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-iot-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+              - 'iot:Publish'
+            Resource: 
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/status/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/commands/*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/status/*"
+
+  # Lambda Functions will be defined in separate nested stacks for clarity
+
+Outputs:
+  VideoStreamName:
+    Description: Kinesis Video Stream Name
+    Value: !Ref VideoStream
+    
+  VideoFramesBucketName:
+    Description: S3 Bucket for Video Frames
+    Value: !Ref VideoFramesBucket
+    
+  WebAppBucketName:
+    Description: S3 Bucket for Web Application
+    Value: !Ref WebAppBucket
+    
+  DetectionsTableName:
+    Description: DynamoDB Table for Object Detections
+    Value: !Ref DetectionsTable
+    
+  IoTPolicyName:
+    Description: IoT Policy for Edge Device
+    Value: !Ref IoTPolicy
