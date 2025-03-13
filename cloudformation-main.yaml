@@ -179,6 +179,15 @@ Resources:
                 Action:
                   - 'iot:DescribeEndpoint'
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'cloudfront:CreateInvalidation'
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+                
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt FrameProcessorFunction.Arn
 
   # API Gateway Role
   ApiGatewayRole:
