@@ -1238,6 +1238,7 @@ Resources:
           import cfnresponse
           import os
           import tempfile
+          import time
 
           def lambda_handler(event, context):
               """Deploy web application to S3 bucket"""
