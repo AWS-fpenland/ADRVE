@@ -1,12 +1,10 @@
 template-file-path: cloudformation-main.yaml
 Parameters:
-  ProjectName: adrve
-  OperatorEmail: fpenland@amazon.com
+  ProjectName: "adrve"
+  OperatorEmail: "fpenland@amazon.com"
   VideoStreamResolution: "1280x720"
-  VideoStreamFrameRate: 15
+  VideoStreamFrameRate: "15"
   BedrockModelId: "anthropic.claude-3-5-sonnet-20241022-v2:0"
-  FrameExtractionRate: 3
+  FrameExtractionRate: "3"
 tags:
     environment: 'demo'
-
-
