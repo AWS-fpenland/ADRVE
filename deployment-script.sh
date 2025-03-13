@@ -5,7 +5,7 @@ set -e
 
 # Configuration variables
 PROJECT_NAME="adrve"
-REGION="us-east-1"  # Change to your preferred region
+REGION="us-west-2"  # Change to your preferred region
 STACK_NAME="${PROJECT_NAME}-stack"
 TEMPLATE_FILE="cloudformation-main.yaml"
 OPERATOR_EMAIL=""
@@ -13,6 +13,13 @@ OPERATOR_EMAIL=""
 # Check for AWS CLI
 if ! command -v aws &> /dev/null; then
     echo "AWS CLI is required but not installed. Please install it first."
+    exit 1
+fi
+
+# Check if template file exists
+if [ ! -f "$TEMPLATE_FILE" ]; then
+    echo "Error: CloudFormation template file $TEMPLATE_FILE not found."
+    echo "Please ensure you have the template file in the current directory."
     exit 1
 fi
 
@@ -38,12 +45,6 @@ echo "Region: $REGION"
 echo "Project Name: $PROJECT_NAME"
 echo "Stack Name: $STACK_NAME"
 echo "Operator Email: $OPERATOR_EMAIL"
-
-# Write CloudFormation template to file
-echo "Creating CloudFormation template file..."
-cat > $TEMPLATE_FILE << 'EOL'
-# Insert CloudFormation template content here
-EOL
 
 # Validate CloudFormation template
 echo "Validating CloudFormation template..."
