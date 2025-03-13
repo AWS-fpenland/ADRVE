@@ -183,11 +183,11 @@ Resources:
                 Action:
                   - 'cloudfront:CreateInvalidation'
                 Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
-                
               - Effect: Allow
                 Action:
                   - 'lambda:InvokeFunction'
-                Resource: !GetAtt FrameProcessorFunction.Arn
+                Resource: '*'
+              
 
   # API Gateway Role
   ApiGatewayRole:
