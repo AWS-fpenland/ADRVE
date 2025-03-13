@@ -9,6 +9,7 @@ Parameters:
   
   OperatorEmail:
     Type: String
+    Default: user@domain.com
     Description: Email address for the operator to receive notifications
     
   VideoStreamResolution:
