@@ -105,6 +105,8 @@ def setup_aws_credentials(profile_name):
             
         # Create .kvs directory if it doesn't exist
         os.makedirs(".kvs", exist_ok=True)
+        kvs_cred_dir = os.path.join(KVS_PRODUCER_PATH, '.kvs')
+        os.makedirs(kvs_cred_dir, exist_ok=True)
         
         # Get the frozen credentials to ensure they don't expire during our session
         frozen_credentials = credentials.get_frozen_credentials()
@@ -119,8 +121,11 @@ def setup_aws_credentials(profile_name):
         if frozen_credentials.token:
             cred_data["sessionToken"] = frozen_credentials.token
             
-        # Write credentials to file
+        # Write credentials to file in both locations
         with open(".kvs/credential", "w") as f:
+            json.dump(cred_data, f)
+            
+        with open(os.path.join(kvs_cred_dir, "credential"), "w") as f:
             json.dump(cred_data, f)
             
         print("AWS credentials set up successfully")
@@ -292,24 +297,38 @@ def start_kvs_producer():
                 
         print(f"Copied log configuration to {kvs_log_config_path}")
         
-        # Build command for the KVS producer - based on source code analysis
-        # The first argument should be the stream name
+        # Build command for the KVS producer
+        # Try RTSP first (preferred by AWS documentation)
+        rtsp_url = "rtsp://10.31.50.195:8554/test"  # Update with your RTSP URL
         kvs_command = [
             f"{KVS_PRODUCER_PATH}/kvs_gstreamer_sample",
             f"{STREAM_NAME}",
             "-w", f"{FRAME_WIDTH}",
             "-h", f"{FRAME_HEIGHT}",
             "-f", f"{FPS}",
-            # Don't specify video device as it doesn't exist in WSL
-            # Use RTMP source instead
-            "-s", "rtmp://10.31.50.195:1935/live/test"
+            # Use RTSP source
+            "-rtsp", rtsp_url
         ]
+        
+        # Fallback to RTMP if needed
+        # If RTSP doesn't work, uncomment this and comment out the above
+        # rtmp_url = "rtmp://10.31.50.195:1935/live/test"  # Update with your RTMP URL
+        # kvs_command = [
+        #     f"{KVS_PRODUCER_PATH}/kvs_gstreamer_sample",
+        #     f"{STREAM_NAME}",
+        #     "-w", f"{FRAME_WIDTH}",
+        #     "-h", f"{FRAME_HEIGHT}",
+        #     "-f", f"{FPS}",
+        #     # Use RTMP source
+        #     "-r", rtmp_url
+        # ]
         
         # Set environment variables for the process
         env = os.environ.copy()
         env['LD_LIBRARY_PATH'] = f"{KVS_PRODUCER_PATH}:{os.environ.get('LD_LIBRARY_PATH', '')}"
         env['AWS_DEFAULT_REGION'] = AWS_REGION
         env['GST_DEBUG'] = '3'  # Add GStreamer debug level for more verbose output
+        env['GST_PLUGIN_PATH'] = KVS_PRODUCER_PATH  # Set GStreamer plugin path to find kvssink
         
         # Explicitly set AWS credentials in environment variables
         session = boto3.Session(profile_name=aws_profile)

@@ -12,6 +12,7 @@ __pycache__/
 .crt
 .kvs
 console-log.txt
+test-console.txt
 credential
 
 # Distribution / packaging
