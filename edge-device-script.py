@@ -24,8 +24,6 @@ Usage:
   --profile: Optional AWS profile name to use (default: default)
 """
 
-import argparse
-
 import os
 import sys
 import time
@@ -87,6 +85,50 @@ running = True
 cloud_commands = {}
 # AWS Profile to use
 aws_profile = "default"
+
+# ==================== AWS CREDENTIALS SETUP ====================
+def setup_aws_credentials(profile_name):
+    """Set up AWS credentials for the script and KVS producer"""
+    global aws_profile
+    
+    print(f"Setting up AWS credentials using profile: {profile_name}")
+    aws_profile = profile_name
+    
+    try:
+        # Create a boto3 session with the specified profile
+        session = boto3.Session(profile_name=profile_name)
+        credentials = session.get_credentials()
+        
+        if not credentials:
+            print(f"No credentials found for profile: {profile_name}")
+            return False
+            
+        # Create .kvs directory if it doesn't exist
+        os.makedirs(".kvs", exist_ok=True)
+        
+        # Get the frozen credentials to ensure they don't expire during our session
+        frozen_credentials = credentials.get_frozen_credentials()
+        
+        # Write credentials to file for KVS producer
+        cred_data = {
+            "accessKeyId": frozen_credentials.access_key,
+            "secretAccessKey": frozen_credentials.secret_key
+        }
+        
+        # Add session token if present (for temporary credentials)
+        if frozen_credentials.token:
+            cred_data["sessionToken"] = frozen_credentials.token
+            
+        # Write credentials to file
+        with open(".kvs/credential", "w") as f:
+            json.dump(cred_data, f)
+            
+        print("AWS credentials set up successfully")
+        return True
+        
+    except Exception as e:
+        print(f"Error setting up AWS credentials: {str(e)}")
+        return False
 
 # ==================== YOLO MODEL ====================
 def initialize_yolo():
@@ -204,50 +246,132 @@ def publish_detection(client, detection):
         print(f"Error publishing detection: {str(e)}")
 
 # ==================== VIDEO STREAMING ====================
-os.environ['KVSSINK_LOG_CONFIG_PATH'] = os.path.abspath(os.path.join(KVS_PRODUCER_PATH, '..', 'kvs_log_configuration'))
+# Create log directory
+os.makedirs("log", exist_ok=True)
+
+# Set up logging environment variables
+# Note: KVS producer expects the log config file in a specific location
+# We'll create it directly in the KVS build directory
+kvs_log_path = os.path.join(KVS_PRODUCER_PATH, 'kvs_log_configuration')
+print(f"Setting KVS log configuration path to: {kvs_log_path}")
+os.environ['KVSSINK_LOG_CONFIG_PATH'] = kvs_log_path
 os.environ['KVSSINK_VERBOSE_LOGGING'] = '1'  # Enable verbose logging
 
 def start_kvs_producer():
     """Start the Kinesis Video Stream producer as a separate process"""
     try:
-        # Build command for the KVS producer
+        print("Starting KVS producer...")
+        
+        # Ensure the log directory exists
+        os.makedirs("log", exist_ok=True)
+        
+        # Create .kvs directory directly in the KVS_PRODUCER_PATH
+        kvs_cred_dir = os.path.join(KVS_PRODUCER_PATH, '.kvs')
+        os.makedirs(kvs_cred_dir, exist_ok=True)
+        
+        # Read credentials from our local .kvs directory
+        try:
+            with open(".kvs/credential", "r") as src_file:
+                cred_data = json.load(src_file)
+                
+                # Write credentials to the KVS producer directory
+                with open(os.path.join(kvs_cred_dir, "credential"), "w") as dst_file:
+                    json.dump(cred_data, dst_file)
+                    
+            print(f"Copied credentials to {kvs_cred_dir}")
+        except Exception as e:
+            print(f"Error copying credentials: {str(e)}")
+            return None
+        
+        # Create log configuration directly in the KVS_PRODUCER_PATH
+        kvs_log_config_path = os.path.join(KVS_PRODUCER_PATH, "kvs_log_configuration")
+        with open("kvs_log_configuration", "r") as src_file:
+            log_config = src_file.read()
+            with open(kvs_log_config_path, "w") as dst_file:
+                dst_file.write(log_config)
+                
+        print(f"Copied log configuration to {kvs_log_config_path}")
+        
+        # Build command for the KVS producer - based on source code analysis
+        # The first argument should be the stream name
         kvs_command = [
             f"{KVS_PRODUCER_PATH}/kvs_gstreamer_sample",
-            f"AWS_REGION={AWS_REGION}",
-            f"STREAM_NAME={STREAM_NAME}",
-            f"VIDEO_WIDTH={FRAME_WIDTH}",
-            f"VIDEO_HEIGHT={FRAME_HEIGHT}",
-            f"VIDEO_FPS={FPS}",
-            "RETENTION_PERIOD=2"  # 2 hours retention
+            f"{STREAM_NAME}",
+            "-w", f"{FRAME_WIDTH}",
+            "-h", f"{FRAME_HEIGHT}",
+            "-f", f"{FPS}",
+            # Don't specify video device as it doesn't exist in WSL
+            # Use RTMP source instead
+            "-s", "rtmp://10.31.50.195:1935/live/test"
         ]
         
-        print(f"Executing command: {' '.join(kvs_command)}")
+        # Set environment variables for the process
+        env = os.environ.copy()
+        env['LD_LIBRARY_PATH'] = f"{KVS_PRODUCER_PATH}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+        env['AWS_DEFAULT_REGION'] = AWS_REGION
+        env['GST_DEBUG'] = '3'  # Add GStreamer debug level for more verbose output
+        
+        # Explicitly set AWS credentials in environment variables
+        session = boto3.Session(profile_name=aws_profile)
+        credentials = session.get_credentials()
+        if credentials:
+            frozen_creds = credentials.get_frozen_credentials()
+            env['AWS_ACCESS_KEY_ID'] = frozen_creds.access_key
+            env['AWS_SECRET_ACCESS_KEY'] = frozen_creds.secret_key
+            if frozen_creds.token:
+                env['AWS_SESSION_TOKEN'] = frozen_creds.token
+            print("Added AWS credentials to environment variables")
+        
+        print(f"Executing KVS command: {' '.join(kvs_command)}")
+        print(f"From directory: {KVS_PRODUCER_PATH}")
+        print(f"With LD_LIBRARY_PATH: {env['LD_LIBRARY_PATH']}")
+        print(f"With AWS_DEFAULT_REGION: {env['AWS_DEFAULT_REGION']}")
         
         # Start process and capture output
-        process = subprocess.Popen(
-            kvs_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,  # Enable text mode for easier reading
-            bufsize=1   # Line buffered
-        )
-        
-        # Create threads to read output
-        def read_output(pipe, prefix):
-            for line in iter(pipe.readline, ''):
-                print(f"{prefix}: {line.strip()}")
-                
-        stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "KVS OUT"))
-        stderr_thread = threading.Thread(target=read_output, args=(process.stderr, "KVS ERR"))
-        stdout_thread.daemon = True
-        stderr_thread.daemon = True
-        stdout_thread.start()
-        stderr_thread.start()
-        
-        print(f"Started KVS producer with PID: {process.pid}")
-        return process
+        try:
+            process = subprocess.Popen(
+                kvs_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,  # Enable text mode for easier reading
+                bufsize=1,   # Line buffered
+                env=env,      # Pass environment variables
+                cwd=KVS_PRODUCER_PATH  # Run from KVS directory
+            )
+            
+            print(f"Started KVS producer with PID: {process.pid}")
+            
+            # Create threads to read output
+            def read_output(pipe, prefix):
+                try:
+                    for line in iter(pipe.readline, ''):
+                        print(f"{prefix}: {line.strip()}")
+                except Exception as e:
+                    print(f"Error in {prefix} reader thread: {str(e)}")
+                    
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "KVS OUT"))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, "KVS ERR"))
+            stdout_thread.daemon = True
+            stderr_thread.daemon = True
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            # Check if process is running
+            time.sleep(1)
+            if process.poll() is not None:
+                print(f"KVS process exited immediately with code: {process.returncode}")
+                stdout, stderr = process.communicate()
+                print(f"KVS stdout: {stdout}")
+                print(f"KVS stderr: {stderr}")
+                return None
+            
+            return process
+        except Exception as e:
+            print(f"Failed to start KVS process: {str(e)}")
+            return None
     except Exception as e:
-        print(f"Failed to start KVS producer: {str(e)}")
+        print(f"Failed to set up KVS producer: {str(e)}")
+        traceback.print_exc()
         return None
 
 def capture_video():
@@ -255,7 +379,12 @@ def capture_video():
     global running
     try:
         print(f"Opening video device {VIDEO_DEVICE}")
+        # Try RTMP stream first, fall back to local camera if that fails
         cap = cv2.VideoCapture("rtmp://10.31.50.195:1935/live/test")
+        if not cap.isOpened():
+            print("Failed to open RTMP stream, falling back to local camera")
+            cap = cv2.VideoCapture(VIDEO_DEVICE)
+            
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, FPS)
@@ -356,8 +485,20 @@ def capture_video():
 def main():
     """Main function"""
     global running
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='ADRVE Edge Device Script')
+    parser.add_argument('--profile', type=str, default='default',
+                       help='AWS profile name to use')
+    args = parser.parse_args()
+    
     try:
         print("Starting ADRVE Edge Device...")
+        
+        # Setup AWS credentials
+        if not setup_aws_credentials(args.profile):
+            print("Failed to set up AWS credentials. Exiting.")
+            return
         
         # Initialize YOLO model
         model = initialize_yolo()

@@ -10,8 +10,12 @@ __pycache__/
 .pem
 .key
 .crt
+.kvs
+console-log.txt
+credential
 
 # Distribution / packaging
+.kvs/
 certs/
 .Python
 build/
