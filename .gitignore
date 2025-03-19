@@ -6,7 +6,13 @@ __pycache__/
 # C extensions
 *.so
 
+# sensitive files
+.pem
+.key
+.crt
+
 # Distribution / packaging
+certs/
 .Python
 build/
 develop-eggs/

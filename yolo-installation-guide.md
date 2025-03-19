@@ -45,7 +45,7 @@ pip install opencv-python boto3 AWSIoTPythonSDK
 from ultralytics import YOLO
 
 # This will download the YOLOv11n model if not already present
-model = YOLO("yolov11n.pt")
+model = YOLO("yolo11n.pt")
 ```
 
 ### 4. Install Kinesis Video Streams Producer SDK
