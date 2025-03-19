@@ -128,6 +128,13 @@ def setup_aws_credentials(profile_name):
         with open(os.path.join(kvs_cred_dir, "credential"), "w") as f:
             json.dump(cred_data, f)
             
+        # Also set environment variables for direct use
+        os.environ['AWS_ACCESS_KEY_ID'] = frozen_credentials.access_key
+        os.environ['AWS_SECRET_ACCESS_KEY'] = frozen_credentials.secret_key
+        if frozen_credentials.token:
+            os.environ['AWS_SESSION_TOKEN'] = frozen_credentials.token
+        os.environ['AWS_DEFAULT_REGION'] = AWS_REGION
+            
         print("AWS credentials set up successfully")
         return True
         
@@ -290,38 +297,55 @@ def start_kvs_producer():
         
         # Create log configuration directly in the KVS_PRODUCER_PATH
         kvs_log_config_path = os.path.join(KVS_PRODUCER_PATH, "kvs_log_configuration")
-        with open("kvs_log_configuration", "r") as src_file:
-            log_config = src_file.read()
-            with open(kvs_log_config_path, "w") as dst_file:
-                dst_file.write(log_config)
-                
-        print(f"Copied log configuration to {kvs_log_config_path}")
+        try:
+            with open("kvs_log_configuration", "r") as src_file:
+                log_config = src_file.read()
+                with open(kvs_log_config_path, "w") as dst_file:
+                    dst_file.write(log_config)
+            print(f"Copied log configuration to {kvs_log_config_path}")
+        except FileNotFoundError:
+            print("Log configuration file not found, continuing without it")
         
-        # Build command for the KVS producer
-        # Try RTSP first (preferred by AWS documentation)
-        rtsp_url = "rtsp://10.31.50.195:8554/test"  # Update with your RTSP URL
+        # RTSP URL to use
+        rtsp_url = "rtsp://10.31.50.195:554/live"  # Updated with working RTSP URL
+        
+        # Method 1: Use GStreamer pipeline directly with kvssink
+        # This is the method that worked in our testing
         kvs_command = [
+            "gst-launch-1.0", "-v",
+            "rtspsrc", f"location={rtsp_url}", "short-header=TRUE", "!",
+            "rtph264depay", "!", "h264parse", "!",
+            "video/x-h264,stream-format=avc,alignment=au", "!",
+            "kvssink", f"stream-name={STREAM_NAME}", "storage-size=256"
+        ]
+        
+        # Method 2: Use KVS GStreamer sample (fallback)
+        # If Method 1 fails, we'll try this approach
+        kvs_sample_command = [
             f"{KVS_PRODUCER_PATH}/kvs_gstreamer_sample",
             f"{STREAM_NAME}",
             "-w", f"{FRAME_WIDTH}",
             "-h", f"{FRAME_HEIGHT}",
             "-f", f"{FPS}",
-            # Use RTSP source
             "-rtsp", rtsp_url
         ]
         
         # Fallback to RTMP if needed
-        # If RTSP doesn't work, uncomment this and comment out the above
-        # rtmp_url = "rtmp://10.31.50.195:1935/live/test"  # Update with your RTMP URL
-        # kvs_command = [
-        #     f"{KVS_PRODUCER_PATH}/kvs_gstreamer_sample",
-        #     f"{STREAM_NAME}",
-        #     "-w", f"{FRAME_WIDTH}",
-        #     "-h", f"{FRAME_HEIGHT}",
-        #     "-f", f"{FPS}",
-        #     # Use RTMP source
-        #     "-r", rtmp_url
-        # ]
+        # If both RTSP methods fail, we can try RTMP
+        rtmp_url = "rtmp://10.31.50.195:1935/live/test"  # Update with your RTMP URL
+        rtmp_command = [
+            f"{KVS_PRODUCER_PATH}/kvs_gstreamer_sample",
+            f"{STREAM_NAME}",
+            "-w", f"{FRAME_WIDTH}",
+            "-h", f"{FRAME_HEIGHT}",
+            "-f", f"{FPS}",
+            "-r", rtmp_url
+        ]
+        
+        # We'll use Method 1 (direct GStreamer pipeline) as our primary approach
+        # since it worked in our testing
+        print(f"Using direct GStreamer pipeline with RTSP source: {rtsp_url}")
+        kvs_command = kvs_command
         
         # Set environment variables for the process
         env = os.environ.copy()
@@ -342,9 +366,8 @@ def start_kvs_producer():
             print("Added AWS credentials to environment variables")
         
         print(f"Executing KVS command: {' '.join(kvs_command)}")
-        print(f"From directory: {KVS_PRODUCER_PATH}")
+        print(f"With GST_PLUGIN_PATH: {env['GST_PLUGIN_PATH']}")
         print(f"With LD_LIBRARY_PATH: {env['LD_LIBRARY_PATH']}")
-        print(f"With AWS_DEFAULT_REGION: {env['AWS_DEFAULT_REGION']}")
         
         # Start process and capture output
         try:
@@ -354,8 +377,7 @@ def start_kvs_producer():
                 stderr=subprocess.PIPE,
                 text=True,  # Enable text mode for easier reading
                 bufsize=1,   # Line buffered
-                env=env,      # Pass environment variables
-                cwd=KVS_PRODUCER_PATH  # Run from KVS directory
+                env=env      # Pass environment variables
             )
             
             print(f"Started KVS producer with PID: {process.pid}")
@@ -382,7 +404,57 @@ def start_kvs_producer():
                 stdout, stderr = process.communicate()
                 print(f"KVS stdout: {stdout}")
                 print(f"KVS stderr: {stderr}")
-                return None
+                
+                # Try Method 2 if Method 1 fails
+                print("Method 1 failed. Trying Method 2 with KVS GStreamer sample...")
+                process = subprocess.Popen(
+                    kvs_sample_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    env=env,
+                    cwd=KVS_PRODUCER_PATH  # Run from KVS directory
+                )
+                
+                # Set up output readers for Method 2
+                stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "KVS OUT"))
+                stderr_thread = threading.Thread(target=read_output, args=(process.stderr, "KVS ERR"))
+                stdout_thread.daemon = True
+                stderr_thread.daemon = True
+                stdout_thread.start()
+                stderr_thread.start()
+                
+                # Check if Method 2 is running
+                time.sleep(1)
+                if process.poll() is not None:
+                    print(f"Method 2 failed with code: {process.returncode}")
+                    
+                    # Try Method 3 (RTMP) if Method 2 fails
+                    print("Method 2 failed. Trying Method 3 with RTMP...")
+                    process = subprocess.Popen(
+                        rtmp_command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        env=env,
+                        cwd=KVS_PRODUCER_PATH
+                    )
+                    
+                    # Set up output readers for Method 3
+                    stdout_thread = threading.Thread(target=read_output, args=(process.stdout, "KVS OUT"))
+                    stderr_thread = threading.Thread(target=read_output, args=(process.stderr, "KVS ERR"))
+                    stdout_thread.daemon = True
+                    stderr_thread.daemon = True
+                    stdout_thread.start()
+                    stderr_thread.start()
+                    
+                    # Check if Method 3 is running
+                    time.sleep(1)
+                    if process.poll() is not None:
+                        print(f"All methods failed. Last exit code: {process.returncode}")
+                        return None
             
             return process
         except Exception as e:
@@ -390,6 +462,7 @@ def start_kvs_producer():
             return None
     except Exception as e:
         print(f"Failed to set up KVS producer: {str(e)}")
+        import traceback
         traceback.print_exc()
         return None
 
