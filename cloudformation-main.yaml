@@ -1174,6 +1174,7 @@ Resources:
       IdentityPoolId: !Ref IdentityPool
       Region: !Ref AWS::Region
       ProjectName: !Ref ProjectName
+      DeploymentTimestamp: !Ref "AWS::AccountId"
 
   IoTEndpoint:
     Type: Custom::IoTEndpoint
