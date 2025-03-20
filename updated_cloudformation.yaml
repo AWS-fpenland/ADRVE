@@ -9,6 +9,7 @@ Parameters:
   
   OperatorEmail:
     Type: String
+    Default: user@domain.com
     Description: Email address for the operator to receive notifications
     
   VideoStreamResolution:
@@ -42,6 +43,12 @@ Resources:
           - Id: DeleteOldFrames
             Status: Enabled
             ExpirationInDays: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
   
   WebAppBucket:
     Type: AWS::S3::Bucket
@@ -49,6 +56,13 @@ Resources:
       BucketName: !Sub "${ProjectName}-webapp-${AWS::AccountId}"
       WebsiteConfiguration:
         IndexDocument: index.html
+        ErrorDocument: error.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
   
   # Kinesis Video Stream
   VideoStream:
@@ -74,7 +88,10 @@ Resources:
           KeyType: HASH
         - AttributeName: timestamp
           KeyType: RANGE
-  
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
   # IAM Roles
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -103,6 +120,12 @@ Resources:
                 Action:
                   - 'kinesisvideo:GetDataEndpoint'
                   - 'kinesisvideo:GetMedia'
+                  - 'kinesisvideo:DescribeStream'
+                  - 'kinesisvideo:ListFragments'
+                Resource: !GetAtt VideoStream.Arn
+              - Effect: Allow
+                Action:
+                  - 'kinesis-video-media:GetMedia'
                 Resource: !GetAtt VideoStream.Arn
               - Effect: Allow
                 Action:
@@ -118,6 +141,10 @@ Resources:
                 Action:
                   - 'iot:Publish'
                 Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-frame-processor"
 
   # IoT Resources
   IoTPolicy:
@@ -140,7 +167,86 @@ Resources:
               - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/commands/*"
               - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/status/*"
 
-  # Lambda Functions will be defined in separate nested stacks for clarity
+  # Lambda Layer for OpenCV
+  OpenCVLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${ProjectName}-opencv-layer"
+      Description: Layer containing OpenCV and NumPy for image processing
+      CompatibleRuntimes:
+        - python3.9
+      Content:
+        S3Bucket: !Ref VideoFramesBucket
+        S3Key: layers/opencv-layer.zip
+      LicenseInfo: MIT
+
+  # Lambda Functions
+  FrameProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-frame-processor"
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 1024
+      Layers:
+        - !Ref OpenCVLayer
+      Environment:
+        Variables:
+          FRAME_BUCKET: !Ref VideoFramesBucket
+          DETECTION_TABLE: !Ref DetectionsTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        S3Bucket: !Ref VideoFramesBucket
+        S3Key: lambda/frame_processor.zip
+
+  FragmentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-fragment-processor"
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FRAME_PROCESSOR_FUNCTION: !Ref FrameProcessorFunction
+      Code:
+        S3Bucket: !Ref VideoFramesBucket
+        S3Key: lambda/fragment_processor.zip
+
+  # Kinesis Data Stream for KVS Fragments
+  FragmentDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-fragments"
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+  # Event Source Mapping to trigger Lambda from Kinesis
+  FragmentProcessorEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt FragmentDataStream.Arn
+      FunctionName: !GetAtt FragmentProcessorFunction.Arn
+      StartingPosition: LATEST
+
+  # KVS Data Delivery Stream
+  KVSDataDeliveryStream:
+    Type: AWS::KinesisVideo::StreamConfig
+    Properties:
+      StreamName: !GetAtt VideoStream.Name
+      MediaSourceConfig:
+        MediaStorageConfiguration:
+          Status: ENABLED
+      NotificationConfiguration:
+        DestinationConfig:
+          DestinationUri: !GetAtt FragmentDataStream.Arn
 
 Outputs:
   VideoStreamName:
@@ -162,3 +268,11 @@ Outputs:
   IoTPolicyName:
     Description: IoT Policy for Edge Device
     Value: !Ref IoTPolicy
+    
+  FrameProcessorFunctionName:
+    Description: Lambda Function for Processing Frames
+    Value: !Ref FrameProcessorFunction
+    
+  FragmentProcessorFunctionName:
+    Description: Lambda Function for Processing Fragments
+    Value: !Ref FragmentProcessorFunction

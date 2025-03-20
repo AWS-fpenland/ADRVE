@@ -18,6 +18,8 @@ test-gpu-fix.txt
 .mkv
 
 # Distribution / packaging
+lambda_fixed/
+assets/
 archive/
 .kvs/
 certs/
