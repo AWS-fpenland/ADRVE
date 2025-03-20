@@ -87,7 +87,6 @@ Resources:
       Name: !Sub "${ProjectName}-video-stream"
       DataRetentionInHours: 24
       MediaType: "video/h264"
-      # StreamingCapability: "BOTH"
       
   # DynamoDB Tables
   DetectionsTable:
@@ -1349,9 +1348,6 @@ Resources:
                   // Global variables
                   let iotClient = null;
                   let kinesisVideoClient = null;
-                  let signalingClient = null;
-                  let peerConnection = null;
-                  let dataChannel = null;
                   let connected = false;
                   let latestDetections = {
                       edge: [],
@@ -1394,7 +1390,7 @@ Resources:
                           // Initialize IoT client
                           initializeIoT();
                           
-                          // Initialize KVS WebRTC
+                          // Initialize KVS connection
                           await initializeKVS();
                           
                           connected = true;
@@ -1462,10 +1458,10 @@ Resources:
                       }
                   }
                   
-                  // Initialize KVS WebRTC
+                  // Initialize KVS connection
                   async function initializeKVS() {
                       try {
-                          console.log("Initializing KVS WebRTC connection");
+                          console.log("Initializing KVS connection");
                           
                           // Make sure AWS credentials are loaded
                           await AWS.config.credentials.getPromise();
@@ -1476,155 +1472,127 @@ Resources:
                               credentials: AWS.config.credentials
                           });
                           
-                          // Get signaling channel ARN
-                          const describeStreamResponse = await kinesisVideoClient.describeStream({
-                              StreamName: config.streamName
+                          // Get data endpoint for the stream
+                          const dataEndpointResponse = await kinesisVideoClient.getDataEndpoint({
+                              StreamName: config.streamName,
+                              APIName: 'GET_MEDIA'
                           }).promise();
                           
-                          const streamARN = describeStreamResponse.StreamInfo.StreamARN;
+                          const dataEndpoint = dataEndpointResponse.DataEndpoint;
                           
-                          // Get ICE server configuration
-                          const kinesisVideoSignalingChannelsClient = new AWS.KinesisVideoSignalingChannels({
+                          // Create KVS media client with the data endpoint
+                          const kvsMediaClient = new AWS.KinesisVideo({
                               region: config.region,
-                              credentials: AWS.config.credentials,
+                              endpoint: dataEndpoint,
+                              credentials: AWS.config.credentials
                           });
                           
-                          // Create signaling client
-                          signalingClient = new KVSWebRTC.SignalingClient({
-                              channelARN: streamARN,
-                              channelEndpoint: kinesisVideoSignalingChannelsClient.endpoint,
-                              clientId: `${config.deviceId}-web-viewer-${Date.now()}`,
-                              role: 'VIEWER',
-                              region: config.region,
-                              credentials: {
-                                  accessKeyId: AWS.config.credentials.accessKeyId,
-                                  secretAccessKey: AWS.config.credentials.secretAccessKey,
-                                  sessionToken: AWS.config.credentials.sessionToken,
-                              },
-                          });
-                          
-                          // Create WebRTC configuration
-                          const configuration = {
-                              iceServers: [
-                                  { urls: 'stun:stun.l.google.com:19302' },
-                                  { urls: 'stun:stun1.l.google.com:19302' },
-                              ],
-                          };
-                          
-                          // Create peer connection
-                          peerConnection = new RTCPeerConnection(configuration);
-                          
-                          // Set up event handlers for the peer connection
-                          peerConnection.ontrack = (event) => {
-                              console.log('Received remote track');
-                              if (event.track.kind === 'video') {
-                                  videoPlayer.srcObject = event.streams[0];
+                          // Get media from the stream
+                          const mediaResponse = await kvsMediaClient.getMedia({
+                              StreamName: config.streamName,
+                              StartSelector: {
+                                  StartSelectorType: 'NOW'
                               }
-                          };
-                          
-                          // Set up signaling client event handlers
-                          signalingClient.on('open', async () => {
-                              console.log('WebSocket connection established');
-                              
-                              // Create an SDP offer to send to the master
-                              const offer = await peerConnection.createOffer({
-                                  offerToReceiveAudio: true,
-                                  offerToReceiveVideo: true,
-                              });
-                              
-                              await peerConnection.setLocalDescription(offer);
-                              
-                              // Send the SDP offer to the master
-                              signalingClient.sendSdpOffer(peerConnection.localDescription);
                           });
                           
-                          signalingClient.on('sdpAnswer', async (answer) => {
-                              console.log('Received SDP answer');
-                              
-                              // Apply the SDP answer as the remote description
-                              await peerConnection.setRemoteDescription(answer);
-                          });
+                          // Create MediaSource object
+                          const mediaSource = new MediaSource();
+                          videoPlayer.src = URL.createObjectURL(mediaSource);
                           
-                          signalingClient.on('iceCandidate', (candidate) => {
-                              console.log('Received ICE candidate');
-                              
-                              // Add the ICE candidate received from the master
-                              peerConnection.addIceCandidate(candidate);
-                          });
-                          
-                          signalingClient.on('close', () => {
-                              console.log('WebSocket connection closed');
-                          });
-                          
-                          signalingClient.on('error', (error) => {
-                              console.error('Signaling client error', error);
-                          });
-                          
-                          // Send any ICE candidates to the other peer
-                          peerConnection.onicecandidate = ({ candidate }) => {
-                              if (candidate) {
-                                  signalingClient.sendIceCandidate(candidate);
+                          // When MediaSource is open, create a SourceBuffer
+                          mediaSource.addEventListener('sourceopen', async () => {
+                              try {
+                                  // For H.264 video
+                                  const mimeType = 'video/mp4; codecs="avc1.42E01E"';
+                                  
+                                  if (!MediaSource.isTypeSupported(mimeType)) {
+                                      throw new Error('Unsupported MIME type or codec: ' + mimeType);
+                                  }
+                                  
+                                  const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+                                  
+                                  // Process the media data
+                                  const reader = mediaResponse.data.getReader();
+                                  
+                                  // Read chunks of data
+                                  while (true) {
+                                      const { done, value } = await reader.read();
+                                      if (done) break;
+                                      
+                                      // Append the chunk to the source buffer
+                                      sourceBuffer.appendBuffer(value);
+                                      
+                                      // Wait for the update to complete
+                                      await new Promise(resolve => {
+                                          sourceBuffer.addEventListener('updateend', resolve, { once: true });
+                                      });
+                                  }
+                              } catch (error) {
+                                  console.error('Error setting up MediaSource:', error);
+                                  initializeFallbackVideo();
                               }
-                          };
+                          });
                           
-                          // Connect to the signaling service
-                          signalingClient.open();
-                          
-                          console.log("KVS WebRTC connection initialized");
+                          console.log("KVS connection initialized");
                       } catch (error) {
-                          console.error("Error initializing KVS WebRTC:", error);
+                          console.error("Error initializing KVS connection:", error);
                           
-                          // Fallback to simulated video if KVS connection fails
-                          console.log("Falling back to simulated video");
-                          
-                          // For this POC, we'll use a canvas to simulate video
-                          const canvas = document.createElement('canvas');
-                          canvas.width = 640;
-                          canvas.height = 480;
-                          const ctx = canvas.getContext('2d');
-                          
-                          // Create a video stream from the canvas
-                          const stream = canvas.captureStream(30);
-                          videoPlayer.srcObject = stream;
-                          
-                          // Simple animation to simulate video feed
-                          function drawFrame() {
-                              // Clear canvas
-                              ctx.fillStyle = '#000000';
-                              ctx.fillRect(0, 0, canvas.width, canvas.height);
-                              
-                              // Draw simulated scene
-                              ctx.fillStyle = '#333333';
-                              ctx.fillRect(100, 100, 440, 280);
-                              
-                              // Draw simulated street
-                              ctx.fillStyle = '#555555';
-                              ctx.fillRect(0, 350, 640, 130);
-                              
-                              // Draw timestamp
-                              ctx.fillStyle = '#ffffff';
-                              ctx.font = '14px Arial';
-                              ctx.fillText(new Date().toISOString(), 10, 20);
-                              
-                              // Draw some simulated objects
-                              // These would be based on actual detections in production
-                              
-                              // Car
-                              ctx.fillStyle = '#0000ff';
-                              ctx.fillRect(200, 300, 100, 50);
-                              
-                              // Person
-                              ctx.fillStyle = '#00ff00';
-                              ctx.fillRect(400, 280, 30, 70);
-                              
-                              requestAnimationFrame(drawFrame);
-                          }
-                          
-                          drawFrame();
-                          
-                          console.log("Simulated video initialized as fallback");
-                          throw error; // Re-throw to show the error in the UI
+                          // Fall back to simulated video
+                          initializeFallbackVideo();
+                          throw error;
                       }
+                  }
+                  
+                  // Initialize fallback video if KVS connection fails
+                  function initializeFallbackVideo() {
+                      console.log("Falling back to simulated video");
+                      
+                      // For this POC, we'll use a canvas to simulate video
+                      const canvas = document.createElement('canvas');
+                      canvas.width = 640;
+                      canvas.height = 480;
+                      const ctx = canvas.getContext('2d');
+                      
+                      // Create a video stream from the canvas
+                      const stream = canvas.captureStream(30);
+                      videoPlayer.srcObject = stream;
+                      
+                      // Simple animation to simulate video feed
+                      function drawFrame() {
+                          // Clear canvas
+                          ctx.fillStyle = '#000000';
+                          ctx.fillRect(0, 0, canvas.width, canvas.height);
+                          
+                          // Draw simulated scene
+                          ctx.fillStyle = '#333333';
+                          ctx.fillRect(100, 100, 440, 280);
+                          
+                          // Draw simulated street
+                          ctx.fillStyle = '#555555';
+                          ctx.fillRect(0, 350, 640, 130);
+                          
+                          // Draw timestamp
+                          ctx.fillStyle = '#ffffff';
+                          ctx.font = '14px Arial';
+                          ctx.fillText(new Date().toISOString(), 10, 20);
+                          
+                          // Draw some simulated objects
+                          // These would be based on actual detections in production
+                          
+                          // Car
+                          ctx.fillStyle = '#0000ff';
+                          ctx.fillRect(200, 300, 100, 50);
+                          
+                          // Person
+                          ctx.fillStyle = '#00ff00';
+                          ctx.fillRect(400, 280, 30, 70);
+                          
+                          requestAnimationFrame(drawFrame);
+                      }
+                      
+                      drawFrame();
+                      
+                      console.log("Simulated video initialized as fallback");
                   }
                   
                   // Update the detection overlay on the video
