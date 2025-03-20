@@ -18,6 +18,7 @@ test-gpu-fix.txt
 .mkv
 
 # Distribution / packaging
+archive/
 .kvs/
 certs/
 .Python
