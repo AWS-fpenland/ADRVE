@@ -311,12 +311,15 @@ Resources:
                   - 'kinesisvideo:GetDataEndpoint'
                   - 'kinesisvideo:GetMedia'
                   - 'kinesisvideo:DescribeStream'
-                  - 'kinesisvideo:GetSignalingChannelEndpoint'
-                  - 'kinesisvideo:ConnectAsMaster'
-                  - 'kinesisvideo:ConnectAsViewer'
-                  - 'kinesisvideo:SendMessage'
-                  - 'kinesisvideo:ReceiveMessage'
                   - 'kinesisvideo:ListFragments'
+                  - 'kinesisvideo:GetHLSStreamingSessionURL'
+                  - 'kinesisvideo:GetDASHStreamingSessionURL'
+                  - 'kinesisvideo:GetClip'
+                  - 'kinesisvideo:GetImages'
+                  - 'kinesisvideo-archived-media:GetHLSStreamingSessionURL'
+                  - 'kinesisvideo-archived-media:GetDASHStreamingSessionURL'
+                  - 'kinesisvideo-archived-media:GetClip'
+                  - 'kinesisvideo-archived-media:GetImages'
                 Resource: !GetAtt VideoStream.Arn
               - Effect: Allow
                 Action:
@@ -1279,7 +1282,7 @@ Resources:
                       <meta name="viewport" content="width=device-width, initial-scale=1.0">
                       <title>ADRVE Operator Interface</title>
                       <script src="https://cdnjs.cloudflare.com/ajax/libs/aws-sdk/2.1001.0/aws-sdk.min.js"></script>
-                      <script src="https://cdnjs.cloudflare.com/ajax/libs/amazon-kinesis-video-streams-webrtc/2.0.0/kvs-webrtc.min.js"></script>
+                      <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
                       <script>
                           // Configuration variables 
                           window.config = {
@@ -1473,66 +1476,91 @@ Resources:
                               credentials: AWS.config.credentials
                           });
                           
-                          // Get data endpoint for the stream
-                          const dataEndpointResponse = await kinesisVideoClient.getDataEndpoint({
+                          // Get HLS URL for the stream
+                          const getHLSStreamingSessionURL = await kinesisVideoClient.getDataEndpoint({
                               StreamName: config.streamName,
-                              APIName: 'GET_MEDIA'
+                              APIName: 'GET_HLS_STREAMING_SESSION_URL'
                           }).promise();
                           
-                          const dataEndpoint = dataEndpointResponse.DataEndpoint;
+                          const hlsEndpoint = getHLSStreamingSessionURL.DataEndpoint;
                           
-                          // Create KVS media client with the data endpoint
-                          const kvsMediaClient = new AWS.KinesisVideo({
+                          // Create KVS client with HLS endpoint
+                          const kvsHlsClient = new AWS.KinesisVideoArchivedMedia({
                               region: config.region,
-                              endpoint: dataEndpoint,
+                              endpoint: hlsEndpoint,
                               credentials: AWS.config.credentials
                           });
                           
-                          // Get media from the stream
-                          const mediaResponse = await kvsMediaClient.getMedia({
+                          // Get HLS URL
+                          const hlsResponse = await kvsHlsClient.getHLSStreamingSessionURL({
                               StreamName: config.streamName,
-                              StartSelector: {
-                                  StartSelectorType: 'NOW'
-                              }
-                          });
-                          
-                          // Create MediaSource object
-                          const mediaSource = new MediaSource();
-                          videoPlayer.src = URL.createObjectURL(mediaSource);
-                          
-                          // When MediaSource is open, create a SourceBuffer
-                          mediaSource.addEventListener('sourceopen', async () => {
-                              try {
-                                  // For H.264 video
-                                  const mimeType = 'video/mp4; codecs="avc1.42E01E"';
-                                  
-                                  if (!MediaSource.isTypeSupported(mimeType)) {
-                                      throw new Error('Unsupported MIME type or codec: ' + mimeType);
+                              PlaybackMode: 'LIVE',
+                              HLSFragmentSelector: {
+                                  FragmentSelectorType: 'SERVER_TIMESTAMP',
+                                  TimestampRange: {
+                                      StartTimestamp: new Date(Date.now() - 30000) // 30 seconds ago
                                   }
-                                  
-                                  const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
-                                  
-                                  // Process the media data
-                                  const reader = mediaResponse.data.getReader();
-                                  
-                                  // Read chunks of data
-                                  while (true) {
-                                      const { done, value } = await reader.read();
-                                      if (done) break;
-                                      
-                                      // Append the chunk to the source buffer
-                                      sourceBuffer.appendBuffer(value);
-                                      
-                                      // Wait for the update to complete
-                                      await new Promise(resolve => {
-                                          sourceBuffer.addEventListener('updateend', resolve, { once: true });
-                                      });
+                              },
+                              ContainerFormat: 'FRAGMENTED_MP4',
+                              DiscontinuityMode: 'ALWAYS',
+                              DisplayFragmentTimestamp: 'NEVER',
+                              MaxMediaPlaylistFragmentResults: 5,
+                              ExpireAfter: 3600
+                          }).promise();
+                          
+                          const hlsUrl = hlsResponse.HLSStreamingSessionURL;
+                          console.log("HLS URL obtained:", hlsUrl);
+                          
+                          // Set the video source to the HLS URL
+                          if (Hls.isSupported()) {
+                              const hls = new Hls({
+                                  debug: false,
+                                  enableWorker: true,
+                                  lowLatencyMode: true,
+                                  backBufferLength: 30
+                              });
+                              
+                              hls.loadSource(hlsUrl);
+                              hls.attachMedia(videoPlayer);
+                              
+                              hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                                  console.log("HLS manifest parsed, attempting to play");
+                                  videoPlayer.play().catch(error => {
+                                      console.error("Error playing video:", error);
+                                  });
+                              });
+                              
+                              hls.on(Hls.Events.ERROR, function(event, data) {
+                                  console.error("HLS error:", data);
+                                  if (data.fatal) {
+                                      switch(data.type) {
+                                          case Hls.ErrorTypes.NETWORK_ERROR:
+                                              console.log("Network error, trying to recover");
+                                              hls.startLoad();
+                                              break;
+                                          case Hls.ErrorTypes.MEDIA_ERROR:
+                                              console.log("Media error, trying to recover");
+                                              hls.recoverMediaError();
+                                              break;
+                                          default:
+                                              console.error("Fatal error, cannot recover");
+                                              initializeFallbackVideo();
+                                              break;
+                                      }
                                   }
-                              } catch (error) {
-                                  console.error('Error setting up MediaSource:', error);
-                                  initializeFallbackVideo();
-                              }
-                          });
+                              });
+                          } else if (videoPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+                              // For Safari
+                              videoPlayer.src = hlsUrl;
+                              videoPlayer.addEventListener('loadedmetadata', function() {
+                                  videoPlayer.play().catch(error => {
+                                      console.error("Error playing video:", error);
+                                  });
+                              });
+                          } else {
+                              console.error("HLS is not supported on this browser");
+                              initializeFallbackVideo();
+                          }
                           
                           console.log("KVS connection initialized");
                       } catch (error) {
@@ -1540,7 +1568,6 @@ Resources:
                           
                           // Fall back to simulated video
                           initializeFallbackVideo();
-                          throw error;
                       }
                   }
                   
