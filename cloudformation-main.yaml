@@ -87,7 +87,7 @@ Resources:
       Name: !Sub "${ProjectName}-video-stream"
       DataRetentionInHours: 24
       MediaType: "video/h264"
-      StreamingCapability: "BOTH"
+      # StreamingCapability: "BOTH"
       
   # DynamoDB Tables
   DetectionsTable:
