@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ADRVE Debug Player (Unauthenticated)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/aws-sdk/2.1001.0/aws-sdk.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f0f0;
+        }
+        h1 {
+            color: #232f3e;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .video-container {
+            margin: 20px 0;
+        }
+        video {
+            width: 100%;
+            background-color: black;
+            height: 480px;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            background-color: #ff9900;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #e88a00;
+        }
+        .log {
+            background-color: #232f3e;
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            margin-top: 20px;
+        }
+        .log-entry {
+            margin: 5px 0;
+            border-bottom: 1px solid #444;
+            padding-bottom: 5px;
+        }
+        .error {
+            color: #ff6b6b;
+        }
+        .success {
+            color: #69db7c;
+        }
+        .info {
+            color: #74c0fc;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ADRVE Debug Player (Unauthenticated)</h1>
+        
+        <div class="form-group">
+            <label for="region">AWS Region:</label>
+            <input type="text" id="region" value="us-west-2">
+        </div>
+        
+        <div class="form-group">
+            <label for="identityPoolId">Cognito Identity Pool ID:</label>
+            <input type="text" id="identityPoolId" value="us-west-2:4979dca7-4346-43b6-b0bb-0822bf749cdb">
+        </div>
+        
+        <div class="form-group">
+            <label for="streamName">KVS Stream Name:</label>
+            <input type="text" id="streamName" value="adrve-video-stream">
+        </div>
+        
+        <div class="controls">
+            <button id="connectBtn">Connect to Stream</button>
+            <button id="testHlsBtn">Test Direct HLS URL</button>
+            <button id="testAwsCredentials">Test AWS Credentials</button>
+        </div>
+        
+        <div class="video-container">
+            <video id="videoPlayer" controls autoplay muted></video>
+        </div>
+        
+        <div class="form-group">
+            <label for="hlsUrl">Direct HLS URL (for testing):</label>
+            <input type="text" id="hlsUrl" placeholder="Enter HLS URL here">
+        </div>
+        
+        <div class="log" id="logContainer"></div>
+    </div>
+    
+    <script>
+        // DOM Elements
+        const videoPlayer = document.getElementById('videoPlayer');
+        const connectBtn = document.getElementById('connectBtn');
+        const testHlsBtn = document.getElementById('testHlsBtn');
+        const testAwsCredentialsBtn = document.getElementById('testAwsCredentials');
+        const logContainer = document.getElementById('logContainer');
+        const regionInput = document.getElementById('region');
+        const identityPoolIdInput = document.getElementById('identityPoolId');
+        const streamNameInput = document.getElementById('streamName');
+        const hlsUrlInput = document.getElementById('hlsUrl');
+        
+        // Log function
+        function log(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+            console.log(`[${type}] ${message}`);
+        }
+        
+        // Initialize HLS.js
+        let hls = null;
+        
+        // Test AWS credentials
+        testAwsCredentialsBtn.addEventListener('click', async () => {
+            try {
+                const region = regionInput.value;
+                const identityPoolId = identityPoolIdInput.value;
+                
+                log(`Testing AWS credentials with identity pool: ${identityPoolId}`);
+                
+                // Configure AWS SDK
+                AWS.config.region = region;
+                AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+                    IdentityPoolId: identityPoolId
+                });
+                
+                // Get AWS credentials
+                log('Getting AWS credentials...');
+                await AWS.config.credentials.getPromise();
+                
+                // Log credential details
+                log(`Identity ID: ${AWS.config.credentials.identityId}`, 'success');
+                log(`Access Key: ${AWS.config.credentials.accessKeyId.substring(0, 5)}...`, 'success');
+                log(`Secret Key: ${AWS.config.credentials.secretAccessKey.substring(0, 5)}...`, 'success');
+                
+                // Test a simple AWS service call
+                log('Testing AWS service call...');
+                const sts = new AWS.STS();
+                const identity = await sts.getCallerIdentity().promise();
+                log(`AWS Account: ${identity.Account}`, 'success');
+                log(`AWS User ARN: ${identity.Arn}`, 'success');
+                log('AWS credentials are working correctly!', 'success');
+                
+            } catch (error) {
+                log(`Error testing AWS credentials: ${error.message}`, 'error');
+                console.error(error);
+            }
+        });
+        
+        // Connect to KVS stream
+        connectBtn.addEventListener('click', async () => {
+            try {
+                const region = regionInput.value;
+                const identityPoolId = identityPoolIdInput.value;
+                const streamName = streamNameInput.value;
+                
+                log(`Connecting to stream: ${streamName} in region ${region}`);
+                
+                // Configure AWS SDK
+                AWS.config.region = region;
+                AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+                    IdentityPoolId: identityPoolId
+                });
+                
+                // Get AWS credentials
+                log('Getting AWS credentials...');
+                await AWS.config.credentials.getPromise();
+                log('AWS credentials loaded successfully', 'success');
+                log(`Identity ID: ${AWS.config.credentials.identityId}`, 'info');
+                
+                // Create KVS client
+                log('Creating KVS client...');
+                const kinesisVideoClient = new AWS.KinesisVideo({
+                    region: region,
+                    credentials: AWS.config.credentials
+                });
+                
+                // Get HLS URL for the stream
+                log('Getting HLS streaming endpoint...');
+                const getHLSStreamingSessionURL = await kinesisVideoClient.getDataEndpoint({
+                    StreamName: streamName,
+                    APIName: 'GET_HLS_STREAMING_SESSION_URL'
+                }).promise();
+                
+                const hlsEndpoint = getHLSStreamingSessionURL.DataEndpoint;
+                log(`HLS endpoint: ${hlsEndpoint}`, 'success');
+                
+                // Create KVS client with HLS endpoint
+                log('Creating KVS archived media client...');
+                const kvsHlsClient = new AWS.KinesisVideoArchivedMedia({
+                    region: region,
+                    endpoint: hlsEndpoint,
+                    credentials: AWS.config.credentials
+                });
+                
+                // Get HLS URL
+                log('Getting HLS streaming URL...');
+                const hlsResponse = await kvsHlsClient.getHLSStreamingSessionURL({
+                    StreamName: streamName,
+                    PlaybackMode: 'LIVE',
+                    HLSFragmentSelector: {
+                        FragmentSelectorType: 'SERVER_TIMESTAMP',
+                        TimestampRange: {
+                            StartTimestamp: new Date(Date.now() - 30000) // 30 seconds ago
+                        }
+                    },
+                    ContainerFormat: 'FRAGMENTED_MP4',
+                    DiscontinuityMode: 'ALWAYS',
+                    DisplayFragmentTimestamp: 'NEVER',
+                    MaxMediaPlaylistFragmentResults: 5,
+                    ExpireAfter: 3600
+                }).promise();
+                
+                const hlsUrl = hlsResponse.HLSStreamingSessionURL;
+                log(`HLS URL obtained: ${hlsUrl}`, 'success');
+                hlsUrlInput.value = hlsUrl;
+                
+                // Play the stream
+                playHlsStream(hlsUrl);
+                
+            } catch (error) {
+                log(`Error: ${error.message}`, 'error');
+                console.error(error);
+            }
+        });
+        
+        // Test direct HLS URL
+        testHlsBtn.addEventListener('click', () => {
+            const hlsUrl = hlsUrlInput.value;
+            if (!hlsUrl) {
+                log('Please enter an HLS URL', 'error');
+                return;
+            }
+            
+            log(`Testing direct HLS URL: ${hlsUrl}`);
+            playHlsStream(hlsUrl);
+        });
+        
+        // Play HLS stream
+        function playHlsStream(url) {
+            // Clean up existing HLS instance if any
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+            
+            // Check if HLS.js is supported
+            if (Hls.isSupported()) {
+                log('Using HLS.js for playback');
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    backBufferLength: 30
+                });
+                
+                hls.loadSource(url);
+                hls.attachMedia(videoPlayer);
+                
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    log('HLS manifest parsed, attempting to play', 'success');
+                    videoPlayer.play().catch(error => {
+                        log(`Error playing video: ${error.message}`, 'error');
+                    });
+                });
+                
+                hls.on(Hls.Events.ERROR, function(event, data) {
+                    log(`HLS error: ${data.type} - ${data.details}`, 'error');
+                    if (data.fatal) {
+                        switch(data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                log('Network error, trying to recover', 'info');
+                                hls.startLoad();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                log('Media error, trying to recover', 'info');
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                log('Fatal error, cannot recover', 'error');
+                                break;
+                        }
+                    }
+                });
+            } else if (videoPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+                // For Safari
+                log('Using native HLS support for playback (Safari)');
+                videoPlayer.src = url;
+                videoPlayer.addEventListener('loadedmetadata', function() {
+                    log('Video metadata loaded, attempting to play', 'success');
+                    videoPlayer.play().catch(error => {
+                        log(`Error playing video: ${error.message}`, 'error');
+                    });
+                });
+            } else {
+                log('HLS is not supported on this browser', 'error');
+            }
+        }
+        
+        // Log initial message
+        log('Debug player initialized. Click "Connect to Stream" to start.');
+    </script>
+</body>
+</html>
