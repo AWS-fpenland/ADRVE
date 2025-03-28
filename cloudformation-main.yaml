@@ -10,7 +10,7 @@ Parameters:
   FrameProcessorImage:
     Type: String
     Description: ECR image URI for the frame processor container
-    Default: ''
+    Default: 056689112963.dkr.ecr.us-west-2.amazonaws.com/frame-processor:ultimate
   
   OperatorEmail:
     Type: String
