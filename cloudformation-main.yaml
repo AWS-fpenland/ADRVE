@@ -10,7 +10,7 @@ Parameters:
   FrameProcessorImage:
     Type: String
     Description: ECR image URI for the frame processor container
-    Default: '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frame-processor:latest'
+    Default: ''
   
   OperatorEmail:
     Type: String
@@ -347,7 +347,7 @@ Resources:
   FrameProcessorFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${ProjectName}-frame-processor"
+      FunctionName: !Sub "${ProjectName}-frame-processor-container"
       Role: !GetAtt LambdaExecutionRole.Arn
       PackageType: Image
       Timeout: 60
