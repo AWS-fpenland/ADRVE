@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ADRVE - Frame Processor Lambda Container Integration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: adrve
+    Description: Name for the project resources
+    
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-3-sonnet-20240229-v1:0"
+    Description: Amazon Bedrock model to use for inference
+    
+  ECRRepositoryName:
+    Type: String
+    Default: "frame-processor"
+    Description: Name of the existing ECR repository
+    
+  ECRImageTag:
+    Type: String
+    Default: "latest"
+    Description: Tag of the container image to deploy
+
+Resources:
+  # Lambda Execution Role with additional permissions for Bedrock
+  FrameProcessorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-frame-processor-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-frame-processor-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: 
+                  - !Sub "arn:aws:s3:::${ProjectName}-video-frames-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-detections"
+              - Effect: Allow
+                Action:
+                  - 'kinesisvideo:GetDataEndpoint'
+                  - 'kinesisvideo:GetMedia'
+                  - 'kinesisvideo:ListFragments'
+                  - 'kinesis-video-archived-media:GetMediaForFragmentList'
+                Resource: !Sub "arn:aws:kinesisvideo:${AWS::Region}:${AWS::AccountId}:stream/${ProjectName}-video-stream/*"
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iot:Publish'
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/*"
+
+  # Lambda Function using Container Image
+  FrameProcessorContainerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-frame-processor"
+      PackageType: Image
+      Role: !GetAtt FrameProcessorExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          FRAME_BUCKET: !Sub "${ProjectName}-video-frames-${AWS::AccountId}"
+          DETECTION_TABLE: !Sub "${ProjectName}-detections"
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepositoryName}:${ECRImageTag}"
+
+Outputs:
+  FrameProcessorFunctionArn:
+    Description: ARN of the frame processor Lambda function
+    Value: !GetAtt FrameProcessorContainerFunction.Arn
+    
+  FrameProcessorRoleArn:
+    Description: ARN of the frame processor execution role
+    Value: !GetAtt FrameProcessorExecutionRole.Arn

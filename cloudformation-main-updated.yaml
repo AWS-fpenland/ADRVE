@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ADRVE - Autonomous Driving with Real-time Video Edge Processing'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project
+    Default: adrve
+  
+  BedrockModelId:
+    Type: String
+    Description: Bedrock model ID to use for image analysis
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+
+Resources:
+  # S3 Buckets
+  VideoFramesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-video-frames"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFrames
+            Status: Enabled
+            ExpirationInDays: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+  
+  WebAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-webapp"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+  
+  # DynamoDB Tables
+  DetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-detections"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: frameId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: frameId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+  
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-lambda-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: 
+                  - !Sub "${VideoFramesBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:GetItem'
+                Resource: 
+                  - !GetAtt DetectionsTable.Arn
+                  - !Sub "${DetectionsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - 'kinesisvideo:GetDataEndpoint'
+                  - 'kinesisvideo:ListFragments'
+                  - 'kinesisvideo:GetMedia'
+                Resource: !Sub "arn:aws:kinesisvideo:${AWS::Region}:${AWS::AccountId}:stream/${ProjectName}-video-stream/*"
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+              - Effect: Allow
+                Action:
+                  - 'iot:Publish'
+                Resource: !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*"
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+  
+  # Kinesis Video Stream
+  VideoStream:
+    Type: AWS::KinesisVideo::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-video-stream"
+      DataRetentionInHours: 24
+      MediaType: "video/h264"
+  
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProcessVideoResource
+      - GetDetectionsResource
+      - SendCommandResource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+  
+  ProcessVideoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: process-video
+  
+  ProcessVideoMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ProcessVideoResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessVideoFunction.Arn}/invocations"
+  
+  GetDetectionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: get-detections
+  
+  GetDetectionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref GetDetectionsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetDetectionsFunction.Arn}/invocations"
+  
+  SendCommandResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: send-command
+  
+  SendCommandMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SendCommandResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendCommandFunction.Arn}/invocations"
+  
+  # Lambda Functions
+  ProcessVideoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-process-video"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Environment:
+        Variables:
+          VIDEO_STREAM_NAME: !Ref VideoStream
+          FRAME_PROCESSOR_FUNCTION: !Ref FrameProcessorFunction
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import time
+
+          def lambda_handler(event, context):
+              """Process Kinesis Video Stream fragments"""
+              try:
+                  stream_name = os.environ['VIDEO_STREAM_NAME']
+                  
+                  # Extract device ID from event or use default
+                  device_id = event.get('deviceId', 'default-device')
+                  
+                  # Get KVS client
+                  kvs_client = boto3.client('kinesisvideo')
+                  
+                  # List fragments
+                  response = kvs_client.list_fragments(
+                      StreamName=stream_name,
+                      MaxResults=1  # Get the latest fragment for POC
+                  )
+                  
+                  # Check if we have fragments
+                  fragments = response.get('Fragments', [])
+                  if not fragments:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps('No fragments found')
+                      }
+                  
+                  # Get the latest fragment
+                  latest_fragment = fragments[0]
+                  fragment_number = latest_fragment.get('FragmentNumber')
+                  
+                  # Invoke the frame processor function
+                  lambda_client = boto3.client('lambda')
+                  lambda_client.invoke(
+                      FunctionName=os.environ['FRAME_PROCESSOR_FUNCTION'],
+                      InvocationType='Event',  # Asynchronous invocation
+                      Payload=json.dumps({
+                          'streamName': stream_name,
+                          'fragmentNumber': fragment_number,
+                          'deviceId': device_id
+                      })
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Processing initiated',
+                          'fragmentNumber': fragment_number
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+  
+  # Updated to use container image
+  FrameProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-frame-processor"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      PackageType: Image
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          FRAME_BUCKET: !Ref VideoFramesBucket
+          DETECTION_TABLE: !Ref DetectionsTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frame-processor:latest"
+  
+  GetDetectionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-detections"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Environment:
+        Variables:
+          DETECTION_TABLE: !Ref DetectionsTable
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from decimal import Decimal
+          from datetime import datetime, timedelta
+
+          # Helper class to convert Decimal to float for JSON serialization
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, o):
+                  if isinstance(o, Decimal):
+                      return float(o)
+                  return super(DecimalEncoder, self).default(o)
+
+          def lambda_handler(event, context):
+              """Get detections from DynamoDB"""
+              try:
+                  # Get query parameters
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  
+                  # Get time range (default to last hour)
+                  end_time = int(query_params.get('end_time', datetime.now().timestamp()))
+                  start_time = int(query_params.get('start_time', (datetime.fromtimestamp(end_time) - timedelta(hours=1)).timestamp()))
+                  
+                  # Query DynamoDB
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['DETECTION_TABLE'])
+                  
+                  # Query by timestamp using GSI
+                  response = table.query(
+                      IndexName='TimestampIndex',
+                      KeyConditionExpression='#ts BETWEEN :start AND :end',
+                      ExpressionAttributeNames={
+                          '#ts': 'timestamp'
+                      },
+                      ExpressionAttributeValues={
+                          ':start': start_time,
+                          ':end': end_time
+                      }
+                  )
+                  
+                  # Return results
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'detections': response.get('Items', []),
+                          'count': len(response.get('Items', [])),
+                          'startTime': start_time,
+                          'endTime': end_time
+                      }, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+  
+  SendCommandFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-send-command"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Environment:
+        Variables:
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import time
+
+          def lambda_handler(event, context):
+              """Send command to IoT device"""
+              try:
+                  # Parse request body
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  # Get command parameters
+                  device_id = body.get('deviceId')
+                  command = body.get('command')
+                  
+                  if not device_id or not command:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'error': 'Missing deviceId or command'
+                          })
+                      }
+                  
+                  # Create command payload
+                  payload = {
+                      'command': command,
+                      'timestamp': int(time.time())
+                  }
+                  
+                  # Add optional parameters
+                  if 'params' in body:
+                      payload['params'] = body['params']
+                  
+                  # Publish to IoT topic
+                  iot_client = boto3.client('iot-data')
+                  topic = f"{os.environ['IOT_TOPIC_PREFIX']}/commands/{device_id}"
+                  
+                  iot_client.publish(
+                      topic=topic,
+                      payload=json.dumps(payload)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': 'Command sent successfully',
+                          'topic': topic
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+  
+  # Lambda Permissions for API Gateway
+  ProcessVideoPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessVideoFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/process-video"
+  
+  GetDetectionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetDetectionsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/get-detections"
+  
+  SendCommandPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendCommandFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/send-command"
+  
+  # CloudFront Origin Access Control (OAC)
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebAppBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized policy
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin policy
+
+  # IoT Resources
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-iot-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+              - 'iot:Publish'
+            Resource:
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-*"
+              - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/*"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  
+  WebAppUrl:
+    Description: URL for the web application
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+  
+  VideoStreamName:
+    Description: Name of the Kinesis Video Stream
+    Value: !Ref VideoStream
+  
+  FrameBucketName:
+    Description: Name of the S3 bucket for video frames
+    Value: !Ref VideoFramesBucket
+  
+  DetectionsTableName:
+    Description: Name of the DynamoDB table for detections
+    Value: !Ref DetectionsTable

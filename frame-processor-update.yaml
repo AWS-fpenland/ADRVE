@@ -1,0 +1,34 @@
+  # Original function (commented out for reference)
+  # FrameProcessorFunction:
+  #   Type: AWS::Lambda::Function
+  #   Properties:
+  #     FunctionName: !Sub "${ProjectName}-frame-processor"
+  #     Handler: index.lambda_handler
+  #     Role: !GetAtt LambdaExecutionRole.Arn
+  #     Runtime: python3.9
+  #     Timeout: 60
+  #     MemorySize: 1024
+  #     Environment:
+  #       Variables:
+  #         FRAME_BUCKET: !Ref VideoFramesBucket
+  #         DETECTION_TABLE: !Ref DetectionsTable
+  #         BEDROCK_MODEL_ID: !Ref BedrockModelId
+  #         IOT_TOPIC_PREFIX: !Ref ProjectName
+
+  # Updated containerized function
+  FrameProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-frame-processor"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      PackageType: Image
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          FRAME_BUCKET: !Ref VideoFramesBucket
+          DETECTION_TABLE: !Ref DetectionsTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          IOT_TOPIC_PREFIX: !Ref ProjectName
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frame-processor:latest"

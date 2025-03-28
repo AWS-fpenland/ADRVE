@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Container resources for ADRVE project'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project
+    Default: adrve
+
+Resources:
+  # ECR Repository for the frame processor container
+  FrameProcessorRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-frame-processor"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+Outputs:
+  FrameProcessorRepositoryUri:
+    Description: URI of the ECR repository for the frame processor
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${FrameProcessorRepository}"
+    Export:
+      Name: !Sub "${ProjectName}-frame-processor-repository-uri"
