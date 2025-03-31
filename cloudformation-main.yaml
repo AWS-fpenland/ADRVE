@@ -383,6 +383,7 @@ Resources:
   # Lambda function to process KVS notifications
   KVSNotificationProcessor:
     Type: AWS::Lambda::Function
+    DependsOn: KVSNotificationIAMPolicy
     Properties:
       FunctionName: !Sub "${ProjectName}-kvs-notification-processor"
       Handler: index.lambda_handler
@@ -452,6 +453,8 @@ Resources:
   # Event source mapping for KVS notification processor
   KVSNotificationEventSourceMapping:
     Type: AWS::Lambda::EventSourceMapping
+    DependsOn: 
+    - KVSNotificationIAMPolicy
     Properties:
       EventSourceArn: !GetAtt KVSNotificationStream.Arn
       FunctionName: !Ref KVSNotificationProcessor
@@ -463,6 +466,7 @@ Resources:
   # Lambda function to set up KVS stream notification
   KVSNotificationSetupFunction:
     Type: AWS::Lambda::Function
+    DependsOn: KVSNotificationIAMPolicy
     Properties:
       FunctionName: !Sub "${ProjectName}-kvs-notification-setup"
       Handler: index.lambda_handler
@@ -529,6 +533,7 @@ Resources:
     DependsOn:
       - VideoStream
       - KVSNotificationStream
+      - KVSNotificationSetupFunction
     Properties:
       ServiceToken: !GetAtt KVSNotificationSetupFunction.Arn
       VideoStreamName: !Ref VideoStream
