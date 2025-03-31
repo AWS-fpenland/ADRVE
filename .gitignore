@@ -16,8 +16,11 @@ test-console.txt
 credential
 test-gpu-fix.txt
 .mkv
+mqtt_logs.txt
 
 # Distribution / packaging
+frames/
+test-videos/
 lambda_fixed/
 assets/
 archive/

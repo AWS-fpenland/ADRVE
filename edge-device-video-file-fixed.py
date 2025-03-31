@@ -60,7 +60,7 @@ KVS_PRODUCER_PATH = "/mnt/c/code/ADRVE/adrve-edge/amazon-kinesis-video-streams-p
 
 # KVS Optimization Parameters
 KVS_STORAGE_SIZE = 1024       # Increased from 128 to 512 MB
-KVS_FRAGMENT_DURATION = 10000 # 5 seconds (in milliseconds) - increased to reduce timestamp issues
+KVS_FRAGMENT_DURATION = 1000 # 5 seconds (in milliseconds) - increased to reduce timestamp issues
 KVS_MAX_LATENCY = 0          # Minimize latency
 
 # YOLO Configuration

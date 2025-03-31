@@ -6,6 +6,6 @@ Parameters:
     VideoStreamFrameRate: 15
     BedrockModelId: anthropic.claude-3-5-sonnet-20241022-v2:0
     FrameExtractionRate: 3
-    FrameProcessorImage: 056689112963.dkr.ecr.us-west-2.amazonaws.com/frame-processor:ultimate
+    FrameProcessorImage: 056689112963.dkr.ecr.us-west-2.amazonaws.com/adrve-frame-processor:latest
 tags:
     environment: demo
