@@ -156,6 +156,9 @@ Resources:
               - 'kinesis:GetShardIterator'
               - 'kinesis:DescribeStream'
               - 'kinesis:ListShards'
+              - 'kinesis:DescribeStreamSummary'
+              - 'kinesis:SubscribeToShard'
+              - 'kinesis:ListStreams'
             Resource: !GetAtt KVSNotificationStream.Arn
           - Effect: Allow
             Action:
