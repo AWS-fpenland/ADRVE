@@ -1,0 +1,187 @@
+# Kinesis Data Stream to receive notifications from KVS
+KVSNotificationStream:
+  Type: AWS::Kinesis::Stream
+  Properties:
+    Name: !Sub "${ProjectName}-kvs-notifications"
+    ShardCount: 1
+    RetentionPeriodHours: 24
+
+# Lambda function to process KVS notifications
+KVSNotificationProcessor:
+  Type: AWS::Lambda::Function
+  Properties:
+    FunctionName: !Sub "${ProjectName}-kvs-notification-processor"
+    Handler: index.lambda_handler
+    Role: !GetAtt LambdaExecutionRole.Arn
+    Runtime: python3.9
+    Timeout: 60
+    MemorySize: 512
+    Environment:
+      Variables:
+        FRAME_PROCESSOR_FUNCTION: !Ref FrameProcessorFunction
+        VIDEO_STREAM_NAME: !Ref VideoStream
+    Code:
+      ZipFile: |
+        import os
+        import json
+        import boto3
+        import base64
+
+        def lambda_handler(event, context):
+            """Process KVS notifications from Kinesis Data Stream"""
+            try:
+                # Get the frame processor function name
+                frame_processor_function = os.environ['FRAME_PROCESSOR_FUNCTION']
+                stream_name = os.environ['VIDEO_STREAM_NAME']
+                
+                # Process each record from Kinesis
+                for record in event['Records']:
+                    # Decode the data
+                    payload = base64.b64decode(record['kinesis']['data'])
+                    notification = json.loads(payload)
+                    
+                    # Extract fragment number from notification
+                    fragment_number = notification.get('fragmentNumber')
+                    if not fragment_number:
+                        print("No fragment number in notification")
+                        continue
+                    
+                    # Extract device ID or use default
+                    device_id = notification.get('deviceId', 'default-device')
+                    
+                    # Invoke the frame processor function
+                    lambda_client = boto3.client('lambda')
+                    lambda_client.invoke(
+                        FunctionName=frame_processor_function,
+                        InvocationType='Event',  # Asynchronous invocation
+                        Payload=json.dumps({
+                            'streamName': stream_name,
+                            'fragmentNumber': fragment_number,
+                            'deviceId': device_id
+                        })
+                    )
+                    
+                    print(f"Processed fragment: {fragment_number}")
+                
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Successfully processed notifications')
+                }
+            
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps(f'Error: {str(e)}')
+                }
+
+# Event source mapping for KVS notification processor
+KVSNotificationEventSourceMapping:
+  Type: AWS::Lambda::EventSourceMapping
+  Properties:
+    EventSourceArn: !GetAtt KVSNotificationStream.Arn
+    FunctionName: !Ref KVSNotificationProcessor
+    StartingPosition: LATEST
+    BatchSize: 10
+    Enabled: true
+    MaximumBatchingWindowInSeconds: 1
+
+# Lambda function to set up KVS stream notification
+KVSNotificationSetupFunction:
+  Type: AWS::Lambda::Function
+  Properties:
+    FunctionName: !Sub "${ProjectName}-kvs-notification-setup"
+    Handler: index.lambda_handler
+    Role: !GetAtt LambdaExecutionRole.Arn
+    Runtime: python3.9
+    Timeout: 60
+    MemorySize: 256
+    Code:
+      ZipFile: |
+        import boto3
+        import json
+        import cfnresponse
+        import time
+
+        def lambda_handler(event, context):
+            """Set up KVS stream notification to Kinesis Data Stream"""
+            try:
+                if event['RequestType'] == 'Delete':
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                    return
+                
+                # Get parameters
+                stream_name = event['ResourceProperties']['VideoStreamName']
+                notification_stream_arn = event['ResourceProperties']['NotificationStreamArn']
+                
+                # Configure KVS stream notification
+                kvs_client = boto3.client('kinesisvideo')
+                
+                # Wait for the stream to be active
+                max_retries = 10
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        response = kvs_client.describe_stream(StreamName=stream_name)
+                        if response['StreamInfo']['Status'] == 'ACTIVE':
+                            break
+                        retries += 1
+                        time.sleep(5)
+                    except Exception as e:
+                        retries += 1
+                        time.sleep(5)
+                
+                # Configure notification
+                response = kvs_client.create_notification_configuration(
+                    StreamName=stream_name,
+                    NotificationDestinationConfig={
+                        'Uri': notification_stream_arn
+                    }
+                )
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                    'NotificationId': response.get('NotificationConfiguration', {}).get('NotificationConfigurationId', '')
+                })
+            
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                cfnresponse.send(event, context, cfnresponse.FAILED, {
+                    'Error': str(e)
+                })
+
+# Custom resource to set up KVS notification
+KVSNotificationSetup:
+  Type: Custom::KVSNotificationSetup
+  DependsOn:
+    - VideoStream
+    - KVSNotificationStream
+  Properties:
+    ServiceToken: !GetAtt KVSNotificationSetupFunction.Arn
+    VideoStreamName: !Ref VideoStream
+    NotificationStreamArn: !GetAtt KVSNotificationStream.Arn
+
+# Additional IAM permissions for KVS notifications
+KVSNotificationIAMPolicy:
+  Type: AWS::IAM::Policy
+  Properties:
+    PolicyName: !Sub "${ProjectName}-kvs-notification-policy"
+    PolicyDocument:
+      Version: '2012-10-17'
+      Statement:
+        - Effect: Allow
+          Action:
+            - 'kinesis:PutRecord'
+            - 'kinesis:PutRecords'
+            - 'kinesis:GetRecords'
+            - 'kinesis:GetShardIterator'
+            - 'kinesis:DescribeStream'
+            - 'kinesis:ListShards'
+          Resource: !GetAtt KVSNotificationStream.Arn
+        - Effect: Allow
+          Action:
+            - 'kinesisvideo:CreateNotificationConfiguration'
+            - 'kinesisvideo:DeleteNotificationConfiguration'
+            - 'kinesisvideo:DescribeNotificationConfiguration'
+          Resource: !GetAtt VideoStream.Arn
+    Roles:
+      - !Ref LambdaExecutionRole
