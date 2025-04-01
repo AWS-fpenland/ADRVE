@@ -70,6 +70,7 @@ def lambda_handler(event, context):
         response = kvs_client.update_notification_configuration(
             StreamName=stream_name,
             NotificationConfiguration={
+                'Status': 'ENABLED',
                 'DestinationConfig': {
                     'Uri': notification_stream_arn
                 }
