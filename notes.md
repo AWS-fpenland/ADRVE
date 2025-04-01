@@ -54,3 +54,30 @@ cmake -G "Visual Studio 17 2022" -A x64 `
   -DENABLE_BROWSER=OFF `
   -DENABLE_UPDATER=OFF `
   ..
+
+
+  ./run_fixed.sh --video-file 1test0.mkv --profile org-master --no-display
+
+  . run_video_file.sh --profile org-master --video-file 1test0.mkv --no-display
+
+
+  KVS ERR: 0:00:01.711520897  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711522750  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711524573  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711526420  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711528232  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711530059  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711531941  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.711533778  8290 0x55b4a1ccade0 WARN      matroskareadcommon matroska-read-common.c:759:gst_matroska_read_common_parse_skip:<matroskademux0:sink> Unknown CueTrackPositions subelement 0xf0 - ignoring
+KVS ERR: 0:00:01.747403470  8290 0x55b4a1d14a30 WARN                     bin gstbin.c:2762:gst_bin_do_latency_func:<pipeline0> did not really configure latency of 0:00:00.000000000 
+KVS ERR: 0:00:01.755297056  8290 0x55b4a1d14a30 WARN                     bin gstbin.c:2762:gst_bin_do_latency_func:<pipeline0> did not really configure latency of 0:00:00.000000000 
+KVS ERR: 0:00:01.755406176  8290 0x55b4a1d14a30 WARN                     bin gstbin.c:2762:gst_bin_do_latency_func:<pipeline0> did not really configure latency of 0:00:00.000000000 
+
+
+
+
+                                      adrve-frame-processor-container
+aws lambda get-policy --function-name adrve-frame-processor-container --profile org-master
+
+
+./run_fixed.sh --video-file "/mnt/c/code/ADRVE/ADRVE/test-videos/1test0.mkv" --profile org-master --no-display

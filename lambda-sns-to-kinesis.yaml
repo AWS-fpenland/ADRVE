@@ -1,0 +1,66 @@
+  # Lambda to forward SNS messages to Kinesis
+  KVSNotificationForwarder:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-sns-to-kinesis"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          KINESIS_STREAM_NAME: !Ref KVSNotificationStream
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          
+          def lambda_handler(event, context):
+              """Forward SNS notifications to Kinesis Data Stream"""
+              try:
+                  # Get the Kinesis stream name
+                  kinesis_stream_name = os.environ['KINESIS_STREAM_NAME']
+                  
+                  # Create Kinesis client
+                  kinesis_client = boto3.client('kinesis')
+                  
+                  # Process SNS message
+                  message = event['Records'][0]['Sns']['Message']
+                  
+                  # Put record to Kinesis
+                  response = kinesis_client.put_record(
+                      StreamName=kinesis_stream_name,
+                      Data=message,
+                      PartitionKey='kvs-notification'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully forwarded notification to Kinesis')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  # SNS subscription for the Lambda function
+  KVSNotificationSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref KVSNotificationTopic
+      Protocol: lambda
+      Endpoint: !GetAtt KVSNotificationForwarder.Arn
+
+  # Permission for SNS to invoke the Lambda function
+  KVSNotificationSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KVSNotificationForwarder
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref KVSNotificationTopic

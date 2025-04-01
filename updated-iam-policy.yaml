@@ -1,0 +1,32 @@
+  # Updated IAM policy to include SNS permissions
+  KVSNotificationIAMPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-kvs-notification-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'kinesis:PutRecord'
+              - 'kinesis:PutRecords'
+              - 'kinesis:GetRecords'
+              - 'kinesis:GetShardIterator'
+              - 'kinesis:DescribeStream'
+              - 'kinesis:ListShards'
+              - 'kinesis:DescribeStreamSummary'
+              - 'kinesis:SubscribeToShard'
+              - 'kinesis:ListStreams'
+            Resource: !GetAtt KVSNotificationStream.Arn
+          - Effect: Allow
+            Action:
+              - 'kinesisvideo:UpdateNotificationConfiguration'
+              - 'kinesisvideo:DescribeNotificationConfiguration'
+              - 'kinesisvideo:DescribeStream'
+            Resource: !GetAtt VideoStream.Arn
+          - Effect: Allow
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref KVSNotificationTopic
+      Roles:
+        - !Ref LambdaExecutionRole
