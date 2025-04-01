@@ -162,12 +162,8 @@ Resources:
             Resource: !GetAtt KVSNotificationStream.Arn
           - Effect: Allow
             Action:
-              - 'kinesisvideo:CreateNotificationConfiguration'
-              - 'kinesisvideo:DeleteNotificationConfiguration'
+              - 'kinesisvideo:UpdateNotificationConfiguration'
               - 'kinesisvideo:DescribeNotificationConfiguration'
-              - 'kinesisvideo:CreateStreamNotificationConfiguration'
-              - 'kinesisvideo:DeleteStreamNotificationConfiguration'
-              - 'kinesisvideo:DescribeStreamNotificationConfiguration'
               - 'kinesisvideo:DescribeStream'
             Resource: !GetAtt VideoStream.Arn
       Roles:
@@ -549,7 +545,7 @@ Resources:
                   
                   # Configure notification using the correct method name and parameter structure
                   logger.info("Creating stream notification configuration")
-                  response = kvs_client.create_stream_notification_configuration(
+                  response = kvs_client.update_notification_configuration(
                       StreamName=stream_name,
                       NotificationConfiguration={
                           'DestinationConfig': {
@@ -558,12 +554,11 @@ Resources:
                       }
                   )
                   
-                  notification_id = response.get('NotificationConfiguration', {}).get('NotificationConfigurationId', '')
-                  logger.info(f"Notification configuration created with ID: {notification_id}")
+                  logger.info(f"Notification configuration created successfully: {json.dumps(response)}")
                   
                   # Send success response
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {
-                      'NotificationId': notification_id
+                      'Status': 'Notification configuration created successfully'
                   })
                   
               except Exception as e:
@@ -571,7 +566,6 @@ Resources:
                   cfnresponse.send(event, context, cfnresponse.FAILED, {
                       'Error': str(e)
                   })
-
 
   # Custom resource to set up KVS notification
   KVSNotificationSetup:
